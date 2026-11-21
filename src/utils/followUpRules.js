@@ -1,17 +1,14 @@
 export const MAX_FOLLOWUPS = 2;
 
-// Monday through Friday, 9 AM to 5 PM.
-// Uses the browser's local timezone.
+// Business hours: Monday-Friday, 9 AM to 5 PM
 export function isBusinessHours(date) {
   const day = date.getDay();
   const hour = date.getHours();
 
-  const isWeekday = day >= 1 && day <= 5;
-  const isWorkingHour = hour >= 9 && hour < 17;
-
-  return isWeekday && isWorkingHour;
+  return day >= 1 && day <= 5 && hour >= 9 && hour < 17;
 }
 
+// Count completed simulated follow-ups.
 export function getFollowUpCount(events = []) {
   return events.filter(
     (event) =>
@@ -20,6 +17,7 @@ export function getFollowUpCount(events = []) {
   ).length;
 }
 
+// Validate a follow-up before scheduling.
 export function validateFollowUp({ quote, scheduledDate, activity = [] }) {
   if (!quote) {
     return "No quote selected.";
@@ -30,7 +28,11 @@ export function validateFollowUp({ quote, scheduledDate, activity = [] }) {
   }
 
   if (getFollowUpCount(activity) >= MAX_FOLLOWUPS) {
-    return "The two-follow-up demonstration limit has been reached.";
+    return "The maximum number of follow-ups has been reached.";
+  }
+
+  if (!scheduledDate) {
+    return "Please select a follow-up date.";
   }
 
   const date = new Date(scheduledDate);
@@ -44,7 +46,7 @@ export function validateFollowUp({ quote, scheduledDate, activity = [] }) {
   }
 
   if (!isBusinessHours(date)) {
-    return "Choose Monday–Friday between 9 AM and 5 PM.";
+    return "Schedule follow-ups Monday-Friday, 9 AM to 5 PM.";
   }
 
   return null;

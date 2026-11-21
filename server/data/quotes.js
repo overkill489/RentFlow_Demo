@@ -1,0 +1,42 @@
+export const quotes = [
+  {
+    id: "QT-1001",
+    customer: "West Texas Construction",
+    equipment: "CAT 305 Mini Excavator",
+    amount: 1850,
+    date: "Nov 18, 2026",
+    status: "Follow-up Due",
+  },
+  {
+    id: "QT-1002",
+    customer: "Lone Star Contractors",
+    equipment: "Bobcat S650 Skid Steer",
+    amount: 2400,
+    date: "Nov 19, 2026",
+    status: "Pending",
+  },
+  {
+    id: "QT-1003",
+    customer: "Permian Basin Services",
+    equipment: "19ft Scissor Lift",
+    amount: 975,
+    date: "Nov 16, 2026",
+    status: "Follow-up Due",
+  },
+  {
+    id: "QT-1004",
+    customer: "Summit Siteworks",
+    equipment: "John Deere 310 Backhoe",
+    amount: 3200,
+    date: "Nov 14, 2026",
+    status: "Accepted",
+  },
+  {
+    id: "QT-1005",
+    customer: "Red Rock Development",
+    equipment: "12k Telehandler",
+    amount: 4100,
+    date: "Nov 19, 2026",
+    status: "Pending",
+  },
+];

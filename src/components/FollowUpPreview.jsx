@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { Mail, Send, ShieldCheck, CalendarClock } from "lucide-react";
 
 function generateMessage(quote, tone) {
-  const firstName = quote.customer;
+  const customer = quote.customer;
 
   if (tone === "friendly") {
-    return `Hi ${firstName},
+    return `Hi ${customer},
 
 Just checking in about your rental quote for the ${quote.equipment}.
 
@@ -18,7 +18,7 @@ The Rental Team`;
   }
 
   if (tone === "brief") {
-    return `Hi ${firstName},
+    return `Hi ${customer},
 
 Following up on quote ${quote.id} for the ${quote.equipment}.
 
@@ -28,7 +28,7 @@ Thanks,
 The Rental Team`;
   }
 
-  return `Hello ${firstName},
+  return `Hello ${customer},
 
 We are following up regarding your rental quote ${quote.id} for the ${quote.equipment}.
 
@@ -43,10 +43,11 @@ The Rental Team`;
 export default function FollowUpPreview({
   quote,
   scheduledAt,
-  attemptsRemaining,
+  attemptsRemaining = 2,
   onSimulate,
 }) {
   const [tone, setTone] = useState("professional");
+
   const [message, setMessage] = useState(() =>
     generateMessage(quote, "professional"),
   );
@@ -62,10 +63,11 @@ export default function FollowUpPreview({
 
   const canSimulate = !isAccepted && isScheduled && attemptsRemaining > 0;
 
-  const handleSimulation = () => {
+  function handleSimulation() {
     if (!canSimulate || !message.trim()) return;
+
     onSimulate(message);
-  };
+  }
 
   return (
     <section className="preview-content">
@@ -83,12 +85,18 @@ export default function FollowUpPreview({
 
         {isAccepted
           ? "Quote accepted — follow-ups disabled"
-          : !isScheduled
-            ? "Schedule a follow-up to enable the simulation"
-            : isDue
-              ? "Scheduled follow-up is due"
-              : "Follow-up scheduled for a future time"}
+          : attemptsRemaining <= 0
+            ? "Follow-up limit reached"
+            : !isScheduled
+              ? "Schedule a follow-up to enable simulation"
+              : isDue
+                ? "Scheduled follow-up is due"
+                : "Follow-up scheduled for a future time"}
       </div>
+
+      <p className="simulation-disclaimer">
+        Remaining simulated follow-ups: {attemptsRemaining}
+      </p>
 
       <div className="preview-field">
         <label htmlFor="message-tone">Message tone</label>
@@ -143,12 +151,8 @@ export default function FollowUpPreview({
       </button>
 
       <p className="simulation-disclaimer">
-        Remaining simulated follow-ups: {attemptsRemaining}
-      </p>
-
-      <p className="simulation-disclaimer">
-        Simulation bypasses the scheduled time for demonstration purposes. It
-        records a local activity event, not an email delivery.
+        Simulation processes the scheduled follow-up immediately for
+        demonstration purposes. No email is sent.
       </p>
     </section>
   );

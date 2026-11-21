@@ -1,0 +1,215 @@
+.rf-login-page {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 20% 10%, #1d4381 0%, transparent 38%),
+    linear-gradient(135deg, #071326, #101f39);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  font-family: Inter, system-ui, sans-serif;
+  color: #152238;
+}
+
+.rf-login-page * {
+  box-sizing: border-box;
+}
+
+.rf-login-container {
+  width: 100%;
+  max-width: 440px;
+}
+
+.rf-login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-bottom: 32px;
+  color: #fff;
+}
+
+.rf-login-logo {
+  width: 54px;
+  height: 54px;
+  background: #3469f6;
+  display: grid;
+  place-items: center;
+  border-radius: 15px;
+  box-shadow: 0 8px 24px #3469f64a;
+}
+
+.rf-login-brand h1 {
+  font-size: 23px;
+  letter-spacing: 1px;
+  margin: 0;
+  font-weight: 800;
+}
+
+.rf-login-brand p {
+  margin: 5px 0 0;
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: #a9bddf;
+}
+
+.rf-login-card {
+  background: #fff;
+  border-radius: 20px;
+  padding: 38px;
+  box-shadow: 0 20px 70px #0004;
+}
+
+.rf-login-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  color: #3469f6;
+  letter-spacing: 1.3px;
+}
+
+.rf-login-card h2 {
+  margin: 12px 0 8px;
+  font-size: 30px;
+  letter-spacing: -1px;
+  color: #101e33;
+}
+
+.rf-login-description {
+  color: #697991;
+  line-height: 1.7;
+  font-size: 14px;
+  margin: 0 0 28px;
+}
+
+.rf-login-card form {
+  display: flex;
+  flex-direction: column;
+}
+
+.rf-login-card label {
+  font-size: 13px;
+  font-weight: 650;
+  color: #273750;
+  margin-bottom: 9px;
+}
+
+.rf-login-card input {
+  height: 49px;
+  width: 100%;
+  padding: 0 14px;
+  border: 1px solid #d9e1ee;
+  border-radius: 10px;
+  background: #fff;
+  color: #142138;
+  font: inherit;
+  font-size: 14px;
+  margin-bottom: 22px;
+  outline: none;
+}
+
+.rf-login-card input:focus {
+  border-color: #3469f6;
+  box-shadow: 0 0 0 3px #3469f61c;
+}
+
+.rf-login-button {
+  width: 100%;
+  min-height: 50px;
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  align-items: center;
+  border: 0;
+  border-radius: 10px;
+  background: #3469f6;
+  color: white;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.rf-login-button:hover:not(:disabled) {
+  background: #2457df;
+}
+
+.rf-login-button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.rf-login-error {
+  background: #fff0f0;
+  border: 1px solid #ffc9c9;
+  color: #b42318;
+  padding: 12px;
+  border-radius: 9px;
+  font-size: 13px;
+  margin: 0 0 18px;
+}
+
+.rf-login-footer {
+  text-align: center;
+  margin: 24px 0 0;
+  color: #8b98a9;
+  font-size: 12px;
+}
+
+.rf-login-bottom {
+  text-align: center;
+  color: #a4b4cc;
+  font-size: 12px;
+  margin: 24px 0 0;
+}
+
+.rf-login-success {
+  width: 50px;
+  height: 50px;
+  display: grid;
+  place-items: center;
+  background: #e0f7ee;
+  color: #10956d;
+  border-radius: 13px;
+  margin-bottom: 20px;
+}
+
+.rf-account-details {
+  border: 1px solid #e6ebf2;
+  border-radius: 12px;
+  margin: 20px 0 24px;
+  overflow: hidden;
+}
+
+.rf-account-details > div {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid #edf1f6;
+}
+
+.rf-account-details > div:last-child {
+  border-bottom: none;
+}
+
+.rf-account-details span {
+  font-size: 12px;
+  color: #78869b;
+}
+
+.rf-account-details strong {
+  color: #18283e;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 480px) {
+  .rf-login-card {
+    padding: 28px 22px;
+  }
+
+  .rf-login-card h2 {
+    font-size: 26px;
+  }
+}
