@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
@@ -32,9 +33,14 @@ const { db } = await import(fixtureDb);
 process.env.RENTFLOW_UNSUBSCRIBE_BASE_URL = "http://localhost:5000";
 const past = "2025-01-06T16:00:00.000Z";
 const future = "2099-01-05T16:00:00.000Z";
+const journalMode = process.env.RENTFLOW_LOAD_JOURNAL;
+const apiTimeout = Number(process.env.RENTFLOW_LOAD_API_TIMEOUT);
+assert.ok(["delete", "wal"].includes(journalMode));
+assert.ok([0, 250].includes(apiTimeout));
 
 function seed(quotes, companies) {
   const started = performance.now();
+  assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, journalMode);
   const hot = Math.floor(quotes / 5);
   db.exec("BEGIN IMMEDIATE");
   for (let i = 1; i <= companies; i++) {
@@ -87,6 +93,8 @@ function seed(quotes, companies) {
     seeded: { quotes, contacts: quotes, companies, queue: quotes / 10 },
     journal: db.prepare("PRAGMA journal_mode").get().journal_mode,
     timeout: db.prepare("PRAGMA busy_timeout").get().timeout,
+    synchronous: db.prepare("PRAGMA synchronous").get().synchronous,
+    foreignKeys: db.prepare("PRAGMA foreign_keys").get().foreign_keys,
     sqlite: db.prepare("SELECT sqlite_version() AS version").get().version,
   };
 }
@@ -135,6 +143,9 @@ if (mode === "seed") {
     process.disconnect();
   }
 } else if (mode === "http") {
+  assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, journalMode);
+  assert.equal(db.prepare("PRAGMA synchronous").get().synchronous, 2);
+  db.exec(`PRAGMA busy_timeout = ${apiTimeout}`);
   const delay = monitorEventLoopDelay({ resolution: 10 });
   let busy = 0;
   let peakRss = 0;

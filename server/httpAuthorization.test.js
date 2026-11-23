@@ -17,6 +17,8 @@ mkdirSync(join(directory, "database"));
 const fixturePath = join(directory, "database", "db.mjs");
 copyFileSync(new URL(originalDb), fixturePath);
 const fixtureDb = pathToFileURL(fixturePath).href;
+delete process.env.RENTFLOW_SQLITE_PATH;
+delete process.env.RENTFLOW_SQLITE_JOURNAL_MODE;
 
 // Run the real bootstrap with its file path anchored in the temporary directory.
 const hooks = registerHooks({

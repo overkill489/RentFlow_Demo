@@ -17,6 +17,8 @@ const due = "2025-01-01T00:00:00.000Z";
 const secret = "rentflow-http-fixture-secret-only-for-this-temporary-database";
 process.env.JWT_SECRET = secret;
 process.env.RENTFLOW_UNSUBSCRIBE_BASE_URL = "http://localhost:5000";
+delete process.env.RENTFLOW_SQLITE_PATH;
+delete process.env.RENTFLOW_SQLITE_JOURNAL_MODE;
 
 async function loadApp() {
   const originalDb = new URL("../../database/db.js", import.meta.url).href;

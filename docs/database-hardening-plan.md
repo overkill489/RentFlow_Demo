@@ -66,7 +66,7 @@ Every `BEGIN IMMEDIATE` succeeded. DELETE's contention surfaced at `COMMIT`. At 
 - **Runtime and durability.** The measured SQLite 3.54.1 includes the WAL-reset corruption fix introduced in 3.51.3. Verify the embedded SQLite version of the deployed Node build and any external process that opens the file. The repository currently pins neither. Keep FULL durability in any pilot and measure WAL growth, checkpoint progress and write latency while long snapshots are active. The immediate write sweeps still serialize with other writers. A longer API busy timeout would trade immediate errors for synchronous event-loop stalls. [SQLite WAL documentation](https://sqlite.org/wal.html) · [Node SQLite API](https://nodejs.org/download/release/latest-v24.x/docs/api/sqlite.html)
 - **Backups and migrations.** The isolated online backup restored a write committed while an older WAL snapshot was open, passed integrity and foreign-key checks, and contained the expected row. Production still needs a SQLite-aware backup and restore drill on the target volume. A live main-file copy can omit committed WAL frames. Journal mode persists, so any approved conversion should be a controlled maintenance operation with API, scheduler and manual writers stopped, a verified backup, and mode and integrity checks before restart. Concurrent import-time DDL and backfills still need the single-writer migration strategy in rank 1. [SQLite Online Backup API](https://sqlite.org/backup.html) · [SQLite WAL documentation](https://sqlite.org/wal.html)
 
-WAL materially reduced read/write contention on the fixture. Adoption is deferred until the deployment storage, SQLite versions and backup/migration procedures are verified and a journal-mode change is approved. This investigation made no runtime PRAGMA changes.
+WAL materially reduced read/write contention on the fixture. This original investigation made no runtime PRAGMA changes. The later guarded configuration and load comparison appear below. Production adoption still requires verified deployment storage, backup and migration procedures, and approval.
 
 On Node v24.22.3, `node --test --test-reporter=spec` from `server/` ran the full backend suite with **182 passed, 0 failed, 0 skipped and 0 cancelled**. A separate run of `server/database/journalContention.test.js` from the repository root had **3 passed, 0 failed, 0 skipped and 0 cancelled**.
 
@@ -102,3 +102,67 @@ The [validation command](../server/database/validateBackup.js) expects a complet
 Start with a daily off-peak backup followed immediately by validation. Run another before any approved migration or journal-mode change. Shorten the interval if the agreed recovery-point objective requires it, prevent scheduled overlap, and alert if a backup fails validation or the last verified off-host copy becomes stale. Schedule periodic restore drills from off-host media and record recovery time and recovered snapshot age.
 
 Verification on Node v24.22.3 with `node --test --test-reporter=spec` from `server/` yielded **188 passed, 0 failed, 0 skipped, 0 cancelled**. The isolated backup workflow suite yielded **6 passed, 0 failed, 0 skipped, 0 cancelled** and covered WAL visibility, DELETE snapshots, no-overwrite behavior, concurrent publication, corrupt and incomplete snapshots, and foreign-key and path failures.
+
+## Guarded WAL configuration and rollout · 2026-11-23
+
+The current [load comparison](backend-load-test-report.md#journal-mode-comparison--2026-11-23) kept the API timeout at 0 ms and worker timeout at 5,000 ms. At 100,000 tenant quotes and 16 concurrent clients, two APIs went from 15.56% busy failures in DELETE to 4.25% in WAL. With the worker running, failures went from 18.81% to 6.63%. Recovery checks and queue audit counts passed in all cases. A separate WAL experiment at 250 ms API timeout reduced errors to 0 of 1,600 without the worker and 2 of 1,600 with it, but increased event-loop stalls and lowered successful throughput relative to WAL at 0 ms. The application does not apply the experimental timeout.
+
+### Connection settings
+
+The [shared opener](../server/database/openDatabase.js) runs before the existing schema bootstrap in [db.js](../server/database/db.js). The API and the due, reconcile and manual recovery entry points import that same module. The API loads dotenv before the app module, and its scheduler children inherit the process environment. Supply the same settings explicitly for manually invoked jobs. Backup and restore-validation continue to use their explicit CLI paths and standalone connections.
+
+| Setting | Behavior |
+| --- | --- |
+| `RENTFLOW_SQLITE_PATH` unset | The existing `server/storage/rentflow.db` path and bootstrap behavior apply. |
+| `RENTFLOW_SQLITE_PATH` set | Opens the specified absolute existing regular file. A missing path fails rather than seeding a new database at an unintended location. |
+| `RENTFLOW_SQLITE_JOURNAL_MODE` unset | Leaves the file's journal mode unchanged. An existing WAL database remains in WAL mode. |
+| `RENTFLOW_SQLITE_JOURNAL_MODE=wal` | Requires an explicit existing database path and `RENTFLOW_SQLITE_STORAGE=local-single-host`. Sets WAL if needed, verifies the selected mode and sets `synchronous=FULL` for that connection. It leaves foreign-key checks, busy timeouts and the SQLite automatic checkpoint policy in place. |
+
+The opener rejects invalid modes, missing confirmation, relative paths, missing or zero-byte WAL sources, known network filesystem types on Linux, UNC paths, recognizable OneDrive paths, unwritable files or directories and existing sidecars that are not regular, accessible files. WAL requires SQLite 3.51.3 or later in this implementation. The tested Node v24.22.3 embeds SQLite 3.54.1. The detection is partial. Mapped drives, storage abstractions and sync tools can obscure their topology, and local checks cannot establish which other hosts might open the same file. [SQLite WAL documentation](https://sqlite.org/wal.html)
+
+**Hosting status is unknown.** Checked-in startup binds to loopback and starts both worker children on the same host as their parent. There is no repository deployment manifest identifying a persistent volume, replica placement, runtime or backup service. The developer checkout is under OneDrive. The passing benchmarks used the separate local NTFS temporary directory. Before approving a pilot, verify that all API, worker and backup processes access the same persistent local volume from one host, that the service account can create and write the WAL and SHM sidecars, and that the directory is excluded from synchronization. Use a verified SQLite version across every process that opens the file. The test supports a staged single-host pilot, with multi-process contention still open.
+
+### Approved pilot procedure
+
+1. Verify the target storage and runtime above. Drain and stop the API and scheduler children, manual workers and any backup clients. Keep the original database intact. Take a new online backup, run `db:validate-backup` immediately, and verify an off-host copy as described in the backup runbook above.
+2. Set the three variables together in the approved test service environment. The example path is a pre-existing staged copy on a verified local volume.
+
+   ```powershell
+   $env:RENTFLOW_SQLITE_PATH = 'D:/RentFlowPilot/rentflow.db'
+   $env:RENTFLOW_SQLITE_JOURNAL_MODE = 'wal'
+   $env:RENTFLOW_SQLITE_STORAGE = 'local-single-host'
+   @'
+   import { openRentFlowDatabase } from "./server/database/openDatabase.js";
+   const db = openRentFlowDatabase(process.env.RENTFLOW_SQLITE_PATH);
+   try {
+     console.log(db.prepare("PRAGMA journal_mode").get());
+     console.log(db.prepare("PRAGMA synchronous").get());
+   } finally { db.close(); }
+   '@ | node --input-type=module
+   ```
+
+3. Confirm `wal` and `synchronous=2` before starting one API process and its children. Exercise authenticated reads and writes and a due/reconciliation pass, verify the file survives a restart, then take and validate another online snapshot. Observe busy counts, tail latency, queue age, WAL size, checkpoint progress and free disk under representative traffic. Agree on acceptable thresholds before increasing traffic or starting more API processes.
+4. If an approved rollback is needed, drain and stop every connection first and take and validate a fresh backup. Use the same absolute path, clear the WAL mode and storage confirmation variables in the service configuration, then run the following from the repository root with the approved path still set. Restart only after checkpoint and mode verification succeed. Preserve the WAL and SHM files as SQLite manages them.
+
+   ```powershell
+   @'
+   import { openRentFlowDatabase } from "./server/database/openDatabase.js";
+   const path = process.env.RENTFLOW_SQLITE_PATH;
+   if (!path) throw new Error("An explicit approved database path is required");
+   const db = openRentFlowDatabase(path, { RENTFLOW_SQLITE_PATH: path });
+   try {
+     if (db.prepare("PRAGMA journal_mode").get().journal_mode !== "wal") {
+       throw new Error("Expected WAL in the rollback source");
+     }
+     const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+     if (checkpoint.busy !== 0) throw new Error("WAL checkpoint is busy");
+     const result = db.prepare("PRAGMA journal_mode = DELETE").get();
+     if (result.journal_mode !== "delete") throw new Error("DELETE mode was not established");
+     console.log(result);
+   } finally { db.close(); }
+   '@ | node --input-type=module
+   ```
+
+The WAL backup test uses the shared opener and the actual backup and restore-validation commands. With automatic checkpoints disabled on the temporary writer, it verifies the main file stayed byte-for-byte unchanged after the insert. The validated backup contained the committed WAL row and excluded the uncommitted row. The connection tests also exercised persisted WAL and explicit rollback to DELETE. Production storage, monitoring and off-host restore drills remain unverified.
+
+On Node v24.22.3, the full backend suite returned **207 passed, 0 failed, 0 skipped, 0 cancelled**. The separate configuration, contention and backup suite returned **14 passed, 0 failed, 0 skipped, 0 cancelled**. No production mode change or deployment was performed.

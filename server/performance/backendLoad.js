@@ -11,11 +11,17 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
-if (args.length > 1 || (args.length && !["--quick", "--full-only"].includes(args[0]))) {
-  throw new Error("Usage: node server/performance/backendLoad.js [--quick|--full-only]");
+const stageArgs = args.filter((arg) => ["--quick", "--full-only"].includes(arg));
+const journalArgs = args.filter((arg) => /^--journal=(delete|wal)$/.test(arg));
+const timeoutArgs = args.filter((arg) => /^--api-timeout=(0|250)$/.test(arg));
+if (stageArgs.length > 1 || journalArgs.length > 1 || timeoutArgs.length > 1 ||
+    args.length !== stageArgs.length + journalArgs.length + timeoutArgs.length) {
+  throw new Error("Usage: node server/performance/backendLoad.js [--quick|--full-only] [--journal=delete|wal] [--api-timeout=0|250]");
 }
 const quick = args.includes("--quick");
 const full = args.includes("--full-only");
+const journal = journalArgs[0]?.split("=")[1] ?? "delete";
+const apiTimeout = timeoutArgs[0]?.split("=")[1] ?? "0";
 const stages = [
   { quotes: 1000, companies: 10, concurrency: 4, requests: 400 },
   { quotes: 10000, companies: 50, concurrency: 8, requests: 800 },
@@ -30,7 +36,15 @@ const print = (value) => console.log(JSON.stringify(value));
 
 function start(directory, mode, { quotes, companies }) {
   const child = fork(entry, [directory, mode, String(quotes), String(companies)], {
-    env: { ...process.env, JWT_SECRET: secret },
+    env: {
+      ...process.env,
+      JWT_SECRET: secret,
+      RENTFLOW_SQLITE_JOURNAL_MODE: journal === "wal" ? "wal" : "",
+      RENTFLOW_SQLITE_PATH: journal === "wal" ? join(directory, "storage", "rentflow.db") : "",
+      RENTFLOW_SQLITE_STORAGE: journal === "wal" ? "local-single-host" : "",
+      RENTFLOW_LOAD_JOURNAL: journal,
+      RENTFLOW_LOAD_API_TIMEOUT: apiTimeout,
+    },
     stdio: ["ignore", "ignore", "inherit", "ipc"],
     windowsHide: true,
     timeout: 120000,
@@ -173,6 +187,29 @@ async function queryPlans(directory) {
   }
 }
 
+function verifyFixture(directory) {
+  const db = new DatabaseSync(join(directory, "storage", "rentflow.db"), { readOnly: true });
+  try {
+    const scalar = (sql) => Object.values(db.prepare(sql).get())[0];
+    const result = {
+      integrity: scalar("PRAGMA integrity_check"),
+      foreignKeyErrors: db.prepare("PRAGMA foreign_key_check").all().length,
+      detected: scalar("SELECT COUNT(*) FROM followup_due_events"),
+      drafts: scalar("SELECT COUNT(*) FROM outbound_messages WHERE status = 'draft'"),
+      activeQueue: scalar("SELECT COUNT(*) FROM delivery_queue WHERE status = 'pending_review'"),
+      queuedAudit: scalar("SELECT COUNT(*) FROM delivery_queue_audit WHERE event_type = 'queued'"),
+      attempts: scalar("SELECT COUNT(*) FROM delivery_attempts"),
+    };
+    print({ verification: result });
+    assert.deepEqual(result, {
+      integrity: "ok", foreignKeyErrors: 0, detected: 5000, drafts: 11000,
+      activeQueue: 11000, queuedAudit: 11000, attempts: 0,
+    });
+  } finally {
+    db.close();
+  }
+}
+
 async function load(directory, stage, name, replicas, withWorkers) {
   const children = [];
   let workers;
@@ -210,6 +247,15 @@ for (const stage of quick ? stages.slice(0, 1) : full ? stages.slice(2) : stages
   try {
     await mkdir(join(directory, "database"));
     await copyFile(bootstrap, join(directory, "database", "db.mjs"));
+    if (journal === "wal") {
+      await mkdir(join(directory, "storage"));
+      const db = new DatabaseSync(join(directory, "storage", "rentflow.db"));
+      try {
+        db.exec("PRAGMA user_version = 0");
+      } finally {
+        db.close();
+      }
+    }
     const seeder = start(directory, "seed", stage);
     print({ stage, fixture: await seeder.ready });
     await seeder.done();
@@ -224,6 +270,7 @@ for (const stage of quick ? stages.slice(0, 1) : full ? stages.slice(2) : stages
     if (stage.quotes === 100000) {
       await load(directory, stage, "two-api", 2, false);
       await load(directory, stage, "two-api-with-workers", 2, true);
+      verifyFixture(directory);
     }
   } finally {
     await rm(directory, { recursive: true, force: true });

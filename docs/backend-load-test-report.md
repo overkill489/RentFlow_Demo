@@ -84,3 +84,39 @@ At baseline, the largest tenant's quote-list p95 was 395.82 ms versus 221.26 ms 
 The [production audit](production-readiness-audit.md#crash-recovery-and-scale) calls for 100 companies, 100,000 quotes, tenant skew, a mostly future schedule, an overdue burst, 10,000 active queue entries and concurrent API and worker work. This harness covered that fixture and same-host overlap. All worker stages finished below the current 30-second child timeout with zero emails sent. The [database hardening plan](database-hardening-plan.md) calls for agreed launch limits on latency, busy errors and queue lag, but neither document defines numeric HTTP latency, RPS, error or memory SLOs. There is no basis for an SLO pass. The observed shared-file error rates are a reliability blocker for that topology. Worker completion time here covers a single deliberate burst, so sustained queue lag and production storage behavior remain unmeasured.
 
 **Regression verification.** Node v24.22.3 ran the complete backend suite from `server/` with **202 passed, 0 failed, 0 skipped, 0 cancelled**. The changed JavaScript files passed lint. No live database, schema migration, React UI or real email path was used.
+
+## Journal-mode comparison · 2026-11-23
+
+The current code was rerun on the same local NTFS host with a fresh 100-company, 100,000-quote fixture per configuration. Each phase kept the same request mix, 40-request warm-up, 1,600 measured requests and 16 concurrent clients. API processes used FULL synchronous durability and enabled foreign keys. All workers used a 5,000 ms busy timeout. The primary DELETE/WAL comparison kept the API busy timeout at 0 ms. The 250 ms WAL run is a separate test-only wait experiment.
+
+```powershell
+node server/performance/backendLoad.js --full-only --journal=delete
+node server/performance/backendLoad.js --full-only --journal=wal
+node server/performance/backendLoad.js --full-only --journal=wal --api-timeout=250
+```
+
+The harness uses the application WAL opener for every WAL fixture process and sets that process's path to the temporary database. It prints the post-run database checks alongside timing and error metrics. Run cases sequentially. Each row below is one measured phase, so small differences should be treated as run-to-run variation.
+
+| Journal / API timeout | Topology | Attempt / successful RPS | p50 / p95 / p99 (ms) | SQLite busy / 1,600 |
+| --- | --- | ---: | ---: | ---: |
+| DELETE / 0 ms | One API | 92.41 / 92.41 | 109.88 / 446.61 / 459.57 | 0 |
+| WAL / 0 ms | One API | 110.76 / 110.76 | 82.20 / 409.08 / 427.77 | 0 |
+| DELETE / 0 ms | Two APIs | 157.65 / 133.12 | 73.94 / 276.53 / 403.28 | 249 (15.56%) |
+| WAL / 0 ms | Two APIs | 205.24 / 196.52 | 55.70 / 234.96 / 254.18 | 68 (4.25%) |
+| DELETE / 0 ms | Two APIs + worker | 175.05 / 142.12 | 73.90 / 256.13 / 280.22 | 301 (18.81%) |
+| WAL / 0 ms | Two APIs + worker | 204.08 / 190.56 | 56.18 / 234.20 / 256.85 | 106 (6.63%) |
+| WAL / 250 ms | One API | 108.27 / 108.27 | 82.52 / 420.89 / 463.87 | 0 |
+| WAL / 250 ms | Two APIs | 178.91 / 178.91 | 87.58 / 250.05 / 270.04 | 0 |
+| WAL / 250 ms | Two APIs + worker | 167.72 / 167.51 | 90.07 / 252.81 / 385.60 | 2 (0.13%) |
+
+Each HTTP failure was a 500 associated with a busy error. WAL at 0 ms eliminated the read failures seen under DELETE. The 68 remaining failures without the worker were 30 quote creations and 38 schedule writes. With the worker, the 106 failures were 45 creations and 61 schedule writes. The wait experiment avoided most of those failures and lowered successful throughput in both two-API phases. With the worker, p99 rose from 256.85 ms to 385.60 ms and the highest sampled event-loop lag increased from 250.35 to 419.17 ms. The API timeout remains unchanged in the application.
+
+| Worker operation | DELETE / 0 ms elapsed / writer hold | WAL / 0 ms elapsed / writer hold | WAL / 250 ms elapsed / writer hold |
+| --- | ---: | ---: | ---: |
+| Due processing | 374.05 / 372.21 ms | 315.46 / 313.65 ms | 331.64 / 329.52 ms |
+| Queueing | 524.04 / 523.52 ms | 422.20 / 421.51 ms | 452.25 / 451.69 ms |
+| Healthy recovery | 486.41 / 0 ms | 488.34 / 0 ms | 463.70 / 0 ms |
+
+Every worker run recorded 5,000 due events, added 1,000 drafts and 1,000 queue entries, and reconciled 11,000 healthy entries without cancellations or email sends. Final integrity and foreign-key checks passed in all three configurations. Each fixture contained 11,000 active drafts, 11,000 pending queue entries, 11,000 queued audit events and zero attempts. A separate process test verified that a WAL reader can proceed while a writer owns the lock and that a second writer still receives `SQLITE_BUSY` at zero timeout. [Connection and process tests](../server/database/openDatabase.test.js)
+
+The results support a guarded single-host WAL pilot on verified local storage. They do not qualify the two-API topology for production, which still needs a contention strategy and agreed latency targets. See the [rollout and rollback procedure](database-hardening-plan.md#guarded-wal-configuration-and-rollout--2026-11-23).

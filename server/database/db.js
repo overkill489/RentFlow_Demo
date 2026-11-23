@@ -1,5 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { openRentFlowDatabase } from "./openDatabase.js";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { quotes as initialQuotes } from "../data/quotes.js";
@@ -12,11 +11,9 @@ import { installDeliveryPreflightAuditSchema } from "../services/deliveryPreflig
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const storageDirectory = join(currentDirectory, "../storage");
 
-mkdirSync(storageDirectory, { recursive: true });
-
 const databasePath = join(storageDirectory, "rentflow.db");
 
-export const db = new DatabaseSync(databasePath);
+export const db = openRentFlowDatabase(databasePath);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS quotes (

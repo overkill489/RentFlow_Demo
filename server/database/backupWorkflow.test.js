@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { openRentFlowDatabase } from "./openDatabase.js";
 
 const run = promisify(execFile);
 
@@ -51,15 +52,22 @@ function fixture(t) {
 }
 
 test("Backs up committed WAL records and excludes an active uncommitted write", async (t) => {
-  const { source, backup, db } = fixture(t);
+  const { source, backup } = fixture(t);
+  const db = openRentFlowDatabase(source, {
+    RENTFLOW_SQLITE_PATH: source,
+    RENTFLOW_SQLITE_JOURNAL_MODE: "wal",
+    RENTFLOW_SQLITE_STORAGE: "local-single-host",
+  });
+  t.after(() => db.close());
+  const mainFile = readFileSync(source);
   db.exec(`
-    PRAGMA journal_mode = WAL;
     PRAGMA wal_autocheckpoint = 0;
     INSERT INTO recipient_suppressions VALUES ('tenant-b', 'committed@example.test');
     BEGIN IMMEDIATE;
     INSERT INTO recipient_suppressions VALUES ('tenant-a', 'uncommitted@example.test');
   `);
   assert.ok(readFileSync(source + "-wal").length > 32);
+  assert.deepEqual(readFileSync(source), mainFile);
 
   await command("backupDatabase", source, backup);
   assert.equal(db.isTransaction, true);
