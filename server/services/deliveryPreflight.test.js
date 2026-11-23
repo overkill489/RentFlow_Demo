@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { createHash } from "node:crypto";
 import { installUnsubscribeSchema } from "./unsubscribeService.js";
 import { createFollowUpEmailTemplate } from "./followUpEmailTemplate.js";
 import {

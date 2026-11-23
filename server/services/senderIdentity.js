@@ -29,6 +29,7 @@ export function validateSenderIdentity(input) {
     typeof displayName !== "string" ||
     displayName.trim().length < 2 ||
     displayName.trim().length > 80 ||
+    // eslint-disable-next-line no-control-regex -- reject control characters in mail headers
     /[\x00-\x1f\x7f<>]/.test(displayName)
   ) {
     return {
@@ -40,6 +41,7 @@ export function validateSenderIdentity(input) {
   if (
     typeof replyToEmail !== "string" ||
     replyToEmail.length > 254 ||
+    // eslint-disable-next-line no-control-regex -- reject control characters in mail headers
     /[\x00-\x20\x7f<>]/.test(replyToEmail) ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(replyToEmail)
   ) {

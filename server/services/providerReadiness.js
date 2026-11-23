@@ -8,6 +8,7 @@ function normalizeEmail(value) {
   if (
     typeof value !== "string" ||
     value.length > 254 ||
+    // eslint-disable-next-line no-control-regex -- reject control characters in mail headers
     /[\x00-\x20\x7f<>]/.test(value) ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
   ) {

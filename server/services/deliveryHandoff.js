@@ -52,6 +52,7 @@ function claim(db, { provider, account, maxAttempts, format, requireAuthorized }
     });
     if (!identity.valid || !isSingleMailbox(sender.fromEmail) ||
         !isSingleMailbox(sender.replyToEmail) || !isSingleMailbox(recipient) ||
+        // eslint-disable-next-line no-control-regex -- reject control characters in mail headers
         /[\x00-\x1f\x7f]/.test(subject)) {
       return { state: "blocked" };
     }

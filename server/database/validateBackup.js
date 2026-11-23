@@ -11,8 +11,9 @@ const requiredTables = [
   "delivery_queue", "delivery_attempts", "delivery_queue_audit", "company_sender_settings",
   "sender_domain_verifications", "unsubscribe_tokens", "delivery_preflight_audit",
 ];
+const ledgerTables = ["email_delivery_schema", "email_deliveries", "email_delivery_attempts", "email_delivery_events"];
 
-function validate(db) {
+function validate(db, requireLedger) {
   const integrity = db.prepare("PRAGMA integrity_check").all();
   if (integrity.length !== 1 || integrity[0].integrity_check !== "ok") {
     throw new Error("SQLite integrity check failed");
@@ -29,7 +30,23 @@ function validate(db) {
     throw new Error(`Missing RentFlow tables: ${missing.join(", ")}`);
   }
 
-  const counts = Object.fromEntries(requiredTables.map((table) => [
+  const hasLedger = ledgerTables.some((table) => tables.has(table));
+  if (requireLedger && !hasLedger) throw new Error("Email delivery ledger is required");
+  let emailDeliveryVersion;
+  if (hasLedger) {
+    const missingLedger = ledgerTables.filter((table) => !tables.has(table));
+    if (missingLedger.length) throw new Error(`Missing email delivery ledger tables: ${missingLedger.join(", ")}`);
+    emailDeliveryVersion = db.prepare("SELECT max(version) AS version FROM email_delivery_schema").get().version;
+    if (![1, 2].includes(emailDeliveryVersion)) throw new Error("Unsupported email delivery ledger version");
+    const wrongAccount = db.prepare(`
+      SELECT 1 FROM email_delivery_events e JOIN email_deliveries d ON d.id = e.delivery_id
+      WHERE e.provider <> d.provider OR e.provider_account <> d.provider_account LIMIT 1
+    `).get();
+    if (wrongAccount) throw new Error("Email delivery ledger event ownership check failed");
+  }
+
+  const countedTables = hasLedger ? [...requiredTables, ...ledgerTables] : requiredTables;
+  const counts = Object.fromEntries(countedTables.map((table) => [
     table, db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
   ]));
   const probes = {
@@ -51,14 +68,17 @@ function validate(db) {
     }
     representativeRecords[table] = present ? "verified" : "empty";
   }
-  return { integrity: "ok", foreignKeys: "ok", counts, representativeRecords };
+  return { integrity: "ok", foreignKeys: "ok", counts, representativeRecords,
+    ...(hasLedger ? { emailDeliveryVersion } : {}) };
 }
 
 const args = process.argv.slice(2);
+const requireLedger = args[0] === "--require-email-ledger";
+if (requireLedger) args.shift();
 
 try {
   if (args.length !== 1 || !args[0] || args[0].startsWith("-")) {
-    throw new Error("Usage: npm run db:validate-backup -- <backup.db>");
+    throw new Error("Usage: npm run db:validate-backup -- [--require-email-ledger] <backup.db>");
   }
 
   const sourcePath = await realpath(resolve(args[0]));
@@ -78,7 +98,7 @@ try {
     await copyFile(sourcePath, restoredPath, constants.COPYFILE_EXCL);
     const restored = new DatabaseSync(restoredPath, { readOnly: true });
     try {
-      console.log(JSON.stringify(validate(restored)));
+      console.log(JSON.stringify(validate(restored, requireLedger)));
     } finally {
       restored.close();
     }

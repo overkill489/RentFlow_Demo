@@ -157,23 +157,6 @@ const insertQueue = db.prepare(`
   VALUES (?, ?, 'pending_review', ?, ?, ?)
 `);
 
-const approveQueue = db.prepare(`
-  UPDATE delivery_queue
-  SET status = 'approved',
-      updated_at = ?,
-      approved_at = ?
-  WHERE id = ?
-    AND status = 'pending_review'
-`);
-
-const simulateQueue = db.prepare(`
-  UPDATE delivery_queue
-  SET status = 'simulated',
-      updated_at = ?
-  WHERE id = ?
-    AND status = 'approved'
-`);
-
 const cancelQueue = db.prepare(`
   UPDATE delivery_queue
   SET status = 'cancelled',
@@ -189,13 +172,6 @@ const cancelDraft = db.prepare(`
   SET status = 'cancelled'
   WHERE id = ?
     AND status = 'draft'
-`);
-
-const insertAttempt = db.prepare(`
-  INSERT INTO delivery_attempts (
-    id, queue_id, result, description, created_at
-  )
-  VALUES (?, ?, 'simulated', ?, ?)
 `);
 
 const findAttempts = db.prepare(`

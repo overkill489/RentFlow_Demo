@@ -70,7 +70,7 @@ export async function checkSenderDnsVerification(
   const expectedValue = readiness.dnsRecord.value;
 
   let matched = false;
-  let checkResult = "TXT_NOT_FOUND";
+  let checkResult;
 
   try {
     const records = await resolveTxt(expectedName);

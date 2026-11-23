@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { createFollowUpEmailTemplate } from "./services/followUpEmailTemplate.js";
+import { saveSenderIdentity } from "./services/senderIdentity.js";
+import { prepareSenderDomainVerification } from "./services/senderVerification.js";
 
 const entry = new URL("./index.js", import.meta.url);
 
@@ -179,4 +183,99 @@ test("the opt-in one-hop proxy gives different clients separate login rate limit
   assert.equal(await login("192.0.2.20"), 429);
   assert.equal(await login("192.0.2.21"), 400);
   await app.stop();
+});
+
+test("production API and workers cannot dispatch eligible email even with provider-like environment values", async (t) => {
+  const { directory, database, env } = fixture();
+  const egress = join(directory, "unexpected-http");
+  const trap = `
+    import { appendFileSync } from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import http from 'node:http';
+    import https from 'node:https';
+    const forbidden = () => {
+      appendFileSync(${JSON.stringify(egress)}, 'attempt');
+      throw new Error('Unexpected outbound HTTP');
+    };
+    globalThis.fetch = http.request = http.get = https.request = https.get = forbidden;
+    syncBuiltinESMExports();
+  `;
+  const settings = {
+    ...env,
+    NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(trap)}`,
+    RENTFLOW_EMAIL_PROVIDER: "resend",
+    RENTFLOW_FROM_EMAIL: "quotes@sender-a.rentflow.invalid-domain.com",
+    RESEND_API_KEY: "re_synthetic_startup_fixture_key",
+    RENTFLOW_EMAIL_DELIVERY_ENABLED: "1",
+  };
+  const app = await boot(t, directory, settings);
+  const registration = await fetch(app.url + "/api/auth/register", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ companyName: "Synthetic mail fixture", email: "admin@example.test", password: randomBytes(18).toString("hex") }),
+  });
+  assert.equal(registration.status, 201);
+  const { token, user } = await registration.json();
+  const { companyId } = user;
+  const db = new DatabaseSync(database);
+  try {
+    const now = new Date(Date.now() - 60_000).toISOString();
+    saveSenderIdentity(db, companyId, {
+      displayName: "Staging Rental", replyToEmail: "office@sender-a.rentflow.invalid-domain.com",
+    }, now);
+    prepareSenderDomainVerification(db, companyId, now);
+    db.prepare(`
+      UPDATE sender_domain_verifications SET verified_at = ?, last_checked_at = ?, last_check_result = 'TXT_MATCH'
+      WHERE company_id = ?
+    `).run(now, now, companyId);
+    db.prepare(`
+      INSERT INTO quotes (id, company_id, customer, equipment, amount, date, status)
+      VALUES ('email-fixture', ?, 'Fictional customer', 'Lift', 25, ?, 'Follow-up Scheduled')
+    `).run(companyId, now);
+    db.prepare("INSERT INTO follow_ups VALUES ('email-fixture', ?, ?, ?)").run(now, now, now);
+    db.prepare("INSERT INTO quote_contacts VALUES ('email-fixture', 'recipient@example.test', 0, ?, ?)").run(now, now);
+    const message = createFollowUpEmailTemplate(db, {
+      companyId, quoteId: "email-fixture", customer: "Fictional customer", equipment: "Lift", currentTime: now,
+      baseUrl: "https://staging.example.test",
+    });
+    db.prepare(`
+      INSERT INTO outbound_messages VALUES ('email-draft', 'email-fixture', 'recipient@example.test', ?, ?, 'draft', ?)
+    `).run(message.subject, message.body, now);
+    db.prepare("INSERT INTO delivery_queue (id, message_id, created_at, updated_at) VALUES ('email-queue', 'email-draft', ?, ?)")
+      .run(now, now);
+  } finally {
+    db.close();
+  }
+
+  const headers = { Authorization: `Bearer ${token}` };
+  const api = (path, method = "GET") => fetch(`${app.url}/api${path}`, { method, headers });
+  assert.equal((await api("/delivery-queue/email-queue/approve", "POST")).status, 200);
+  const preflight = await api("/delivery-preflight/email-queue");
+  assert.equal(preflight.status, 200);
+  const { data } = await preflight.json();
+  assert.equal(data.technicalChecksPassed, true);
+  for (const flag of ["providerConnectionVerified", "sendingAuthorized", "deliveryEnabled"]) assert.equal(data[flag], false);
+  assert.equal(data.emailsSent, 0);
+  assert.equal((await api("/delivery-preflight-audit/email-queue/check", "POST")).status, 201);
+  assert.equal((await api("/delivery-queue/email-queue/send", "POST")).status, 404);
+  assert.equal((await api("/webhooks/resend", "POST")).status, 404);
+
+  for (const job of ["checkDueFollowUps.js", "reconcileDeliveryQueue.js"]) {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL(`./jobs/${job}`, import.meta.url))], {
+      cwd: directory, env: settings, encoding: "utf8", windowsHide: true, timeout: 10_000,
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(JSON.parse(run.stdout).emailsSent, 0);
+  }
+  const simulation = await api("/delivery-queue/email-queue/simulate", "POST");
+  assert.equal(simulation.status, 200);
+  assert.equal((await simulation.json()).emailsSent, 0);
+  await app.stop();
+  assert.equal(existsSync(egress), false);
+  const persisted = new DatabaseSync(database, { readOnly: true });
+  try {
+    assert.equal(persisted.prepare("SELECT result FROM delivery_attempts WHERE queue_id = 'email-queue'").get().result, "simulated");
+    assert.equal(persisted.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'email_deliveries'").get(), undefined);
+  } finally {
+    persisted.close();
+  }
 });
