@@ -1,0 +1,19 @@
+{$RENTFLOW_STAGING_HOST} {
+	route {
+		@outside not remote_ip 127.0.0.1/32 ::1/128 {$RENTFLOW_STAGING_ALLOWED_IPS}
+		respond @outside 403
+		@metrics path_regexp (?i)^/api/metrics/?$
+		respond @metrics 404
+		@api path /api /api/*
+		handle @api {
+			reverse_proxy 127.0.0.1:5500 {
+				header_up X-Forwarded-For {remote_host}
+			}
+		}
+		handle {
+			root * /opt/rentflow-staging/current/dist
+			try_files {path} /index.html
+			file_server
+		}
+	}
+}
