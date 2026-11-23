@@ -1,4 +1,5 @@
 import jwt from "jsonwebtoken";
+import process from "node:process";
 import { db } from "../database/db.js";
 
 const findUser = db.prepare(`
@@ -30,9 +31,10 @@ export function requireAuth(req, res, next) {
   }
 
   const token = header.slice(7).trim();
+  let payload;
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET, {
+    payload = jwt.verify(token, process.env.JWT_SECRET, {
       algorithms: ["HS256"],
       issuer: "rentflow-api",
       audience: "rentflow-app",
@@ -46,7 +48,14 @@ export function requireAuth(req, res, next) {
     ) {
       throw new Error("Invalid token");
     }
+  } catch {
+    return res.status(401).json({
+      success: false,
+      error: "Invalid or expired token",
+    });
+  }
 
+  try {
     if (findRevokedToken.get(payload.jti)) {
       return res.status(401).json({
         success: false,
@@ -70,11 +79,9 @@ export function requireAuth(req, res, next) {
       expiresAt: payload.exp,
     };
 
-    next();
-  } catch {
-    return res.status(401).json({
-      success: false,
-      error: "Invalid or expired token",
-    });
+  } catch (error) {
+    return next(error);
   }
+
+  next();
 }
