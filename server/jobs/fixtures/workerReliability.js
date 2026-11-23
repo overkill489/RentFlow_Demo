@@ -6,8 +6,8 @@ import process from "node:process";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import jwt from "jsonwebtoken";
-import { processDueFollowUps } from "../dueFollowUpProcessor.js";
-import { queueDueDrafts } from "../../services/queueDueDrafts.js";
+import { processDueFollowUpsInBatches } from "../dueFollowUpProcessor.js";
+import { queueDueDraftsInBatches } from "../../services/queueDueDrafts.js";
 import { runDeliveryQueueAction } from "../../services/deliveryQueueLifecycle.js";
 import { recoverDeliveryQueue } from "../../services/deliveryQueueRecovery.js";
 import { confirmUnsubscribe } from "../../services/unsubscribeService.js";
@@ -60,15 +60,22 @@ function pauseAt(name) {
 function instrument(db) {
   const exec = db.exec.bind(db);
   let commits = 0;
+  let writing = false;
+  let writeCommits = 0;
   db.exec = (sql) => {
     if (sql === "BEGIN IMMEDIATE") pauseAt("before-begin");
-    if (sql === "COMMIT" && ++commits === 1) {
-      pauseAt("before-commit");
+    if (sql === "COMMIT") {
+      if (++commits === 1) pauseAt("before-commit");
       const result = exec(sql);
-      pauseAt("after-commit");
+      if (writing && ++writeCommits === 1) pauseAt("after-write-commit");
+      if (commits === 1) pauseAt("after-commit");
+      writing = false;
       return result;
     }
-    return exec(sql);
+    const result = exec(sql);
+    if (sql === "BEGIN IMMEDIATE") writing = true;
+    if (sql === "ROLLBACK") writing = false;
+    return result;
   };
 }
 
@@ -113,9 +120,11 @@ if (mode === "setup" || mode === "manual") {
     instrument(db);
     let result;
     if (mode.startsWith("due")) {
-      const drafts = processDueFollowUps(db, now);
-      const queue = queueDueDrafts(db, { currentTime: now });
+      const drafts = await processDueFollowUpsInBatches(db, now);
+      const queue = await queueDueDraftsInBatches(db, { currentTime: now });
       result = { drafts, queue };
+    } else if (mode === "queue") {
+      result = await queueDueDraftsInBatches(db, { currentTime: now });
     } else if (mode === "reconcile") {
       result = recoverDeliveryQueue(db, { currentTime: now, includeEntries: false });
     } else if (mode === "unsubscribe") {

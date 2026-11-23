@@ -1,6 +1,7 @@
+import process from "node:process";
 import { db } from "../database/db.js";
-import { processDueFollowUps } from "./dueFollowUpProcessor.js";
-import { queueDueDrafts } from "../services/queueDueDrafts.js";
+import { processDueFollowUps, processDueFollowUpsInBatches } from "./dueFollowUpProcessor.js";
+import { queueDueDrafts, queueDueDraftsInBatches } from "../services/queueDueDrafts.js";
 
 const args = process.argv.slice(2);
 
@@ -20,12 +21,13 @@ const processingTime = atArgument
 try {
   db.exec("PRAGMA busy_timeout = 5000");
 
-  const followUps = processDueFollowUps(db, processingTime, dryRun);
+  const followUps = dryRun
+    ? processDueFollowUps(db, processingTime, true)
+    : await processDueFollowUpsInBatches(db, processingTime);
 
-  const queue = queueDueDrafts(db, {
-    currentTime: processingTime,
-    dryRun,
-  });
+  const queue = dryRun
+    ? queueDueDrafts(db, { currentTime: processingTime, dryRun: true })
+    : await queueDueDraftsInBatches(db, { currentTime: processingTime });
 
   const result = {
     ...followUps,

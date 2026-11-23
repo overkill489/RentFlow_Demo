@@ -168,16 +168,16 @@ async function queryPlans(directory) {
     ["quoteId", "../routes/quotes.js", "getNextId", []],
     ["followupList", "../routes/followups.js", "getQueue", ["c1"]],
     ["queueList", "../routes/deliveryQueue.js", "findAllQueue", ["c1"]],
-    ["dueScan", "../jobs/dueFollowUpProcessor.js", "findDue", [new Date().toISOString()]],
-    ["queueCandidates", "../services/queueDueDrafts.js", "findCandidates", [new Date().toISOString()]],
+    ["dueScan", "../jobs/dueFollowUpProcessor.js", "findDueSql", [new Date().toISOString()], "follow_ups f"],
+    ["queueCandidates", "../services/queueDueDrafts.js", "findCandidatesSql", [new Date().toISOString()], "outbound_messages m"],
     ["recovery", "../services/deliveryQueueRecovery.js", "findActiveEntries", []],
   ];
   try {
-    for (const [name, path, variable, bindings] of targets) {
+    for (const [name, path, variable, bindings, source] of targets) {
       const text = await readFile(new URL(path, import.meta.url), "utf8");
-      const prefix = `const ${variable} = db.prepare(\``;
+      const prefix = source ? `const ${variable} = (source) => \`` : `const ${variable} = db.prepare(\``;
       assert.ok(text.includes(prefix), variable);
-      const sql = text.split(prefix)[1].split("`")[0];
+      const sql = text.split(prefix)[1].split("`")[0].replace("${source}", source);
       const statement = db.prepare(sql);
       statement.all(...bindings);
       const timings = Array.from({ length: 5 }, () => {

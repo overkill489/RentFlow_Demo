@@ -159,3 +159,34 @@ With the 500 ms worker wait, all three worker stages completed in that run. With
 Production timeouts, journal mode and deployment were not changed. The [bounded wait and retry policy](database-hardening-plan.md#bounded-sqlite-lock-waiting--2026-11-23) documents the opt-in, safe boundaries and remaining risks.
 
 Backend verification on Node v24.22.3 from `server/` with `node --test --test-reporter=spec` yielded **210 passed, 0 failed, 0 skipped, 0 cancelled**. The focused connection and independent-process suites yielded **14 passed, 0 failed, 0 skipped, 0 cancelled**.
+
+## Worker writer-lock profiling and batching · 2026-11-23
+
+The isolated harness records `BEGIN IMMEDIATE` acquisition, commit/rollback, and failed lock attempts by API route and worker stage. Worker records include lock windows, individual and aggregate hold times, acquisition waits and rollback counts. The instrumented baseline ran the previous unbatched processors. The after run used the same fixture size, clock-based profiling, WAL with FULL durability, a 25 ms API wait, a 5,000 ms worker wait, and 16 concurrent clients over two API processes. The two measured phases each used 1,600 requests after 40 warm-up requests. The worker ran due processing, queue insertion and recovery in sequence while the second HTTP phase was active.
+
+```powershell
+node server/performance/backendLoad.js --two-only --journal=wal --api-timeout=25 --worker-timeout=5000
+```
+
+| Run | Worker | Busy errors / requests | Attempt / successful RPS | p95 / p99 (ms) |
+| --- | --- | ---: | ---: | ---: |
+| Unbatched baseline | No | 0 / 1,600 | 183.00 / 183.00 | 243.55 / 263.35 |
+| 50-row batches | No | 0 / 1,600 | 184.31 / 184.31 | 245.91 / 268.15 |
+| Unbatched baseline | Yes | 10 / 1,600 (0.625%) | 176.49 / 175.39 | 247.79 / 273.64 |
+| 50-row batches | Yes | 0 / 1,600 | 168.53 / 168.53 | 253.18 / 289.27 |
+
+All ten baseline failures were at API `BEGIN IMMEDIATE`, six on quote creation and four on follow-up scheduling. Comparing timestamps across local processes, six failed wait intervals overlapped only due processing, three overlapped only queue insertion, and one overlapped both. None overlapped a healthy recovery writer lock. The baseline worker-overlap API writer-hold p95 across the two API processes was 14.25–16.46 ms for quote creation and 2.39–3.35 ms for scheduling. Those API operations retain their existing transaction boundaries.
+
+| Stage during worker overlap | Before elapsed / longest hold | After elapsed / longest hold | After transactions / total writer hold |
+| --- | ---: | ---: | ---: |
+| Due detection and drafting | 318.27 / 316.19 ms | 2,830.16 / 27.41 ms | 100 / 759.49 ms |
+| Queue insertion | 434.37 / 424.72 ms | 883.01 / 19.18 ms | 20 / 250.34 ms |
+| Healthy reconciliation | 465.47 / 0 ms | 468.25 / 0 ms | 0 / 0 ms |
+
+The original due stage scanned and wrote 5,000 due events and created 1,000 drafts while holding a single writer slot. The original queue stage checked readiness for 5,000 drafts while holding its slot, including 4,000 that already had a queue row. The new queue pass classifies those existing rows in a read snapshot. The scheduled write paths use primary-key-scoped revalidation in batches of 50, with a 2 ms yield between commits. A settled due/queue replay needs no writer when all detected schedules and queue entries are current. An exploratory 100-row run with keyed revalidation hit one busy error and a 45.54 ms queue hold. The 50-row run traded longer total worker time and lower mixed HTTP throughput for shorter individual locks and zero observed failures. Row limits do not guarantee a wall-clock lock limit.
+
+The worker recorded 5,000 due events and added 1,000 drafts and 1,000 queue rows in both the baseline and the final run. Reconciliation reported 11,000 healthy items, zero cancellations and zero emails sent. Final integrity and foreign-key checks passed. Both runs ended with 11,000 active drafts, pending queue rows and queued audits, and zero delivery attempts. The final 328 quote creations and 492 scheduling activities exactly matched successful HTTP responses including warm-up. [Profiler](../server/performance/transactionProfile.js) · [Batch crash and concurrency tests](../server/jobs/workerReliability.test.js)
+
+The measured improvement applies to the isolated host and workload. Actual reconciliation cancellations can still trigger a larger write sweep. Multi-replica scheduler ownership, sustained backlog growth, startup contention and production-volume latency remain unverified. See the [worker batching and recovery notes](database-hardening-plan.md#bounded-worker-commits--2026-11-23).
+
+**Regression verification.** From `server/`, Node v24.22.3 ran `node --test --test-reporter=spec` with **212 passed, 0 failed, 0 skipped, 0 cancelled**. The separate due, queue, recovery and independent-process run had **47 passed, 0 failed, 0 skipped, 0 cancelled**. Changed JavaScript passed lint.

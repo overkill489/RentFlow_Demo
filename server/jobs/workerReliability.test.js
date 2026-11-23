@@ -140,6 +140,68 @@ test("overlapping due workers replay a crash between the draft and queue commits
   assertSinglePass(db);
 });
 
+test("draft and queue batches resume after a committed batch without duplicate history", async (t) => {
+  const { directory, db } = await fixture(t);
+  db.exec(`
+    CREATE TEMP TABLE bulk AS
+      WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 50)
+      SELECT 'bulk-' || n AS id FROM numbers;
+    INSERT INTO quotes (id, company_id, customer, equipment, amount, date, status)
+      SELECT id, 'a', 'Bulk customer', 'Lift', 100, '2025-01-01', 'Follow-up Scheduled' FROM bulk;
+    INSERT INTO follow_ups
+      SELECT id, '2025-01-01T00:00:00.000Z', '2025-01-01', '2025-01-01' FROM bulk;
+    INSERT INTO quote_contacts
+      SELECT id, id || '@example.test', 0, '2025-01-01', '2025-01-01' FROM bulk;
+  `);
+  for (const expected of [50, 52]) {
+    const drafts = start(t, directory, "due", "after-commit");
+    await drafts.checkpoint("after-commit");
+    assert.equal(count(db, "outbound_messages"), expected);
+    await drafts.crash();
+  }
+
+  const queue = start(t, directory, "queue", "after-write-commit");
+  await queue.checkpoint("after-write-commit");
+  assert.equal(count(db, "delivery_queue"), 50);
+  await queue.crash();
+
+  const replay = await start(t, directory, "due").finish();
+  assert.equal(replay.drafts.recorded, 0);
+  assert.equal(replay.queue.queued, 2);
+  assert.equal(count(db, "delivery_queue"), 52);
+  assert.equal(count(db, "delivery_queue_audit", "event_type = 'queued' AND actor_type = 'system'"), 52);
+  assert.equal(count(db, "activity_logs", "type = 'draft'"), 52);
+  assert.equal(count(db, "followup_due_events"), 52);
+  assert.equal(count(db, "unsubscribe_tokens"), 52);
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const quiet = await start(t, directory, "due-no-wait").finish();
+    assert.equal(quiet.drafts.recorded, 0);
+    assert.equal(quiet.queue.alreadyQueued, 52);
+  } finally {
+    db.exec("ROLLBACK");
+  }
+});
+
+test("queue batches revalidate a suppression committed after the read snapshot", async (t) => {
+  const { directory, db } = await fixture(t);
+  const drafts = start(t, directory, "due", "after-commit");
+  await drafts.checkpoint("after-commit");
+  await drafts.crash();
+
+  const gate = join(directory, "resume-queue");
+  const queue = start(t, directory, "queue", "after-commit", gate);
+  await queue.checkpoint("after-commit");
+  db.exec("INSERT INTO recipient_suppressions VALUES ('a', 'shared@example.test', '2025-01-02')");
+  writeFileSync(gate, "");
+
+  assert.equal((await queue.finish()).queued, 1);
+  assert.equal(queued(db), undefined);
+  assert.equal(queued(db, "quote-b").status, "pending_review");
+  assert.equal(count(db, "delivery_queue_audit", "event_type = 'queued'"), 1);
+});
+
 test("approval races and a crashed simulation preserve status, attempts and audit", async (t) => {
   const { directory, db } = await fixture(t);
   await start(t, directory, "due").finish();

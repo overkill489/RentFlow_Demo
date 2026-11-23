@@ -1,14 +1,17 @@
 import { once } from "node:events";
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createServer } from "node:http";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import jwt from "jsonwebtoken";
-import { processDueFollowUps } from "../jobs/dueFollowUpProcessor.js";
-import { queueDueDrafts } from "../services/queueDueDrafts.js";
+import { processDueFollowUpsInBatches } from "../jobs/dueFollowUpProcessor.js";
+import { queueDueDraftsInBatches } from "../services/queueDueDrafts.js";
 import { recoverDeliveryQueue } from "../services/deliveryQueueRecovery.js";
+import { profileTransactions } from "./transactionProfile.js";
 
 const [directory, mode, sizeArg, companiesArg] = process.argv.slice(2);
 if (!process.send || !directory) throw new Error("Start through backendLoad.js");
@@ -107,39 +110,33 @@ if (mode === "seed") {
   process.disconnect();
 } else if (mode === "workers" || mode === "recovery") {
   db.exec(`PRAGMA busy_timeout = ${workerTimeout}`);
-  const exec = db.exec.bind(db);
-  let began;
-  let holdMs = 0;
-  db.exec = (sql) => {
-    const result = exec(sql);
-    if (sql === "BEGIN IMMEDIATE") began = performance.now();
-    if (began !== undefined && (sql === "COMMIT" || sql === "ROLLBACK")) {
-      holdMs += performance.now() - began;
-      began = undefined;
-    }
-    return result;
-  };
-  const measure = (run) => {
-    holdMs = 0;
+  let phase = "idleRecovery";
+  const takeProfile = profileTransactions(db, () => phase);
+  const measure = async (run) => {
     const start = performance.now();
-    const result = run();
-    return { elapsedMs: performance.now() - start, writerHoldMs: holdMs, result };
+    const result = await run();
+    const profile = takeProfile(true);
+    return { elapsedMs: performance.now() - start,
+      writerHoldMs: profile.writes[phase]?.holdTotalMs ?? 0, profile, result };
   };
   process.send({ ready: true });
   await once(process, "message");
   const results = {};
-  let phase = "idleRecovery";
   try {
     if (mode === "recovery") {
-      process.send(Array.from({ length: 6 }, () =>
-        measure(() => recoverDeliveryQueue(db, { includeEntries: false }))));
+      const samples = [];
+      for (let i = 0; i < 6; i++) {
+        samples.push(await measure(() => recoverDeliveryQueue(db, { includeEntries: false })));
+      }
+      process.send(samples);
     } else {
       phase = "due";
-      results.due = measure(() => processDueFollowUps(db, new Date().toISOString()));
+      const currentTime = new Date().toISOString();
+      results.due = await measure(() => processDueFollowUpsInBatches(db, currentTime));
       phase = "queue";
-      results.queue = measure(() => queueDueDrafts(db));
+      results.queue = await measure(() => queueDueDraftsInBatches(db, { currentTime }));
       phase = "recovery";
-      results.recovery = measure(() => recoverDeliveryQueue(db, { includeEntries: false }));
+      results.recovery = await measure(() => recoverDeliveryQueue(db, { includeEntries: false }));
       process.send(results);
     }
   } catch (error) {
@@ -159,6 +156,8 @@ if (mode === "seed") {
   let peakRss = 0;
   let peakHeap = 0;
   let unexpected = 0;
+  const requests = new AsyncLocalStorage();
+  const takeProfile = profileTransactions(db, () => requests.getStore() ?? "outside HTTP");
   console.error = (error) => {
     if ((error?.errcode & 255) === 5) busy++;
     else if ((error?.errcode & 255) === 6) locked++;
@@ -169,7 +168,11 @@ if (mode === "seed") {
     peakRss = Math.max(peakRss, rss);
     peakHeap = Math.max(peakHeap, heapUsed);
   };
-  const server = createApp().listen(0, "127.0.0.1");
+  const app = createApp();
+  const server = createServer((req, res) => {
+    const route = req.url.replace(/QT-\d+/g, ":id");
+    requests.run(`${req.method} ${route}`, () => app(req, res));
+  }).listen(0, "127.0.0.1");
   await once(server, "listening");
   const tokens = Array.from({ length: Number(companiesArg) }, (_, i) =>
     jwt.sign({ companyId: `c${i + 1}` }, process.env.JWT_SECRET, {
@@ -183,6 +186,7 @@ if (mode === "seed") {
       busy = locked = unexpected = peakRss = peakHeap = 0;
       delay.enable();
       delay.reset();
+      takeProfile();
       sampleMemory();
       process.send(true);
     } else if (command === "metrics") {
@@ -191,7 +195,7 @@ if (mode === "seed") {
       process.send({
         busy, locked, unexpected, peakRss, peakHeap, samples: delay.count,
         lagP95: delay.percentile(95) / 1e6, lagP99: delay.percentile(99) / 1e6,
-        lagMax: delay.max / 1e6,
+        lagMax: delay.max / 1e6, transactions: takeProfile(),
       });
     } else if (command === "stop") {
       clearInterval(timer);
