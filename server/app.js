@@ -14,8 +14,13 @@ import providerReadinessRoutes from "./routes/providerReadiness.js";
 import deliveryPreflightRoutes from "./routes/deliveryPreflight.js";
 import deliveryPreflightAuditRoutes from "./routes/deliveryPreflightAudit.js";
 
-export function createApp() {
+export function createApp({ trustLoopbackProxy = false } = {}) {
   const app = express();
+
+  if (trustLoopbackProxy) {
+    app.set("trust proxy", (address, hop) =>
+      hop === 0 && ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address));
+  }
 
   app.use(express.json({ limit: "20kb" }));
 
