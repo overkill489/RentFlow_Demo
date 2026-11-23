@@ -69,3 +69,36 @@ Every `BEGIN IMMEDIATE` succeeded. DELETE's contention surfaced at `COMMIT`. At 
 WAL materially reduced read/write contention on the fixture. Adoption is deferred until the deployment storage, SQLite versions and backup/migration procedures are verified and a journal-mode change is approved. This investigation made no runtime PRAGMA changes.
 
 On Node v24.22.3, `node --test --test-reporter=spec` from `server/` ran the full backend suite with **182 passed, 0 failed, 0 skipped and 0 cancelled**. A separate run of `server/database/journalContention.test.js` from the repository root had **3 passed, 0 failed, 0 skipped and 0 cancelled**.
+
+## Online backup and isolated restore validation · 2026-11-23
+
+[db.js](../server/database/db.js) opens `server/storage/rentflow.db` and performs initialization on import. The API and existing job scripts all use it. The two backup commands are explicit operator tasks and open only their supplied input paths. They never load application bootstrap or start jobs. The server's ignore rules already cover `storage/`, `*.db`, `*.db-wal` and `*.db-shm`. Keep backup files outside the checkout on restricted storage.
+
+### Commands
+
+From the repository root in PowerShell, use a pre-created backup directory and a unique destination. Replace the example path with the authorized backup location. The backup source below is the current application path, so run this only on the host where that path is the intended database.
+
+```powershell
+$rentflowSource = Join-Path (Get-Location).Path 'server/storage/rentflow.db'
+$rentflowStamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfff'Z'")
+$rentflowBackup = Join-Path 'D:/RentFlowBackups' "rentflow-$rentflowStamp.db"
+npm.cmd --prefix server run db:backup -- "$rentflowSource" "$rentflowBackup"
+if ($LASTEXITCODE -ne 0) { throw 'RentFlow backup failed' }
+npm.cmd --prefix server run db:validate-backup -- "$rentflowBackup"
+if ($LASTEXITCODE -ne 0) { throw 'RentFlow backup validation failed' }
+```
+
+The [backup command](../server/database/backupDatabase.js) opens the existing source read-only and uses Node's SQLite Online Backup API. It captures committed state, including WAL frames SQLite has not checkpointed, and excludes uncommitted writes. It flushes the staged snapshot, then publishes it with a hard link that fails if the destination already exists, including if another process wins the race. The resulting backup is a standalone SQLite file. Use SQLite's backup command during active service. A plain copy of a live SQLite main file can miss committed WAL data or capture inconsistent pages. [Node SQLite backup API](https://nodejs.org/download/release/latest-v24.x/docs/api/sqlite.html#sqlitebackup-sourcedb-path-options) · [SQLite Online Backup API](https://sqlite.org/backup.html)
+
+The [validation command](../server/database/validateBackup.js) expects a completed standalone snapshot. It copies the backup to a fresh private directory under the OS temporary directory, checks `integrity_check` and `foreign_key_check`, verifies the required RentFlow tables, counts rows and probes representative user, quote, follow-up, suppression and queue relationships. Empty tables are reported as empty, and historical tenantless demo quotes are allowed. The JSON contains counts and probe results without customer values. Compare counts and probe results against the expected history, especially if an initialized database is expected to contain tenant data. Validation removes only its temporary copy.
+
+### Storage and recovery limits
+
+- Run with the tested Node v24.22.3 and bundled SQLite 3.54.1 or verify the intended deployed version before relying on the workflow. Run on the database host. WAL reads rely on SQLite's normal sidecar access and locking, so keep the live database and its sidecars together on supported local storage. The source is opened read-only and the utility issues no source checkpoint, schema change or journal-mode switch.
+- Use an existing, access-controlled backup directory on a filesystem that supports hard links, such as NTFS. Staging and publication occur on the same volume. Reserve free space for a full snapshot in the destination and another copy in the OS temporary directory. Use encrypted storage with restricted permissions for both directories. Backups contain customer data, password hashes and delivery metadata. Copy validated backups to encrypted off-host storage under the retention policy and verify that an off-host copy can be retrieved and validated. A local file alone does not protect against host or volume loss.
+- The snapshot represents committed state during backup. Ongoing changes may restart the incremental copy and heavy contention can delay or fail the job. Set and monitor a scheduler deadline suited to database size. Failed runs exit nonzero and do not publish partial snapshots. Abrupt termination may leave a private `.rentflow-backup-*` or `rentflow-restore-*` directory. After an interrupted run, verify any published candidate before using it and handle abandoned work directories under the retention policy.
+- Validation checks snapshot structure and representative relationships. It cannot prove the desired recovery point or cover all application workflows. A production cutover remains a separately approved maintenance action with writers stopped, the existing database preserved, and tenant counts and smoke tests verified against the chosen backup. Record measured recovery time and age of recovered data using a staging restore drill before changing production journaling.
+
+Start with a daily off-peak backup followed immediately by validation. Run another before any approved migration or journal-mode change. Shorten the interval if the agreed recovery-point objective requires it, prevent scheduled overlap, and alert if a backup fails validation or the last verified off-host copy becomes stale. Schedule periodic restore drills from off-host media and record recovery time and recovered snapshot age.
+
+Verification on Node v24.22.3 with `node --test --test-reporter=spec` from `server/` yielded **188 passed, 0 failed, 0 skipped, 0 cancelled**. The isolated backup workflow suite yielded **6 passed, 0 failed, 0 skipped, 0 cancelled** and covered WAL visibility, DELETE snapshots, no-overwrite behavior, concurrent publication, corrupt and incomplete snapshots, and foreign-key and path failures.

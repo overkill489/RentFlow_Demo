@@ -10,7 +10,9 @@
     "check-followups": "node jobs/checkDueFollowUps.js",
     "check-followups:dry": "node jobs/checkDueFollowUps.js --dry-run",
     "recover-queue": "node jobs/recoverDeliveryQueue.js",
-    "recover-queue:dry": "node jobs/recoverDeliveryQueue.js --dry-run"
+    "recover-queue:dry": "node jobs/recoverDeliveryQueue.js --dry-run",
+    "db:backup": "node database/backupDatabase.js",
+    "db:validate-backup": "node database/validateBackup.js"
   },
   "keywords": [],
   "author": "",
