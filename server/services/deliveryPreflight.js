@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isRealDeliveryEnabled } from "./deliveryGate.js";
 import { getDeliveryReadiness } from "./deliveryReadiness.js";
 import { getProviderReadiness } from "./providerReadiness.js";
 
@@ -246,7 +247,7 @@ export function getDeliveryPreflight(
     reasons: [...reasons, ...safetyBlocks],
     providerConnectionVerified: false,
     sendingAuthorized: false,
-    deliveryEnabled: false,
+    deliveryEnabled: isRealDeliveryEnabled(),
     emailsSent: 0,
   };
 }

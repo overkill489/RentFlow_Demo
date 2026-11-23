@@ -1,4 +1,5 @@
 import { getSenderIdentity } from "./senderIdentity.js";
+import { isRealDeliveryEnabled } from "./deliveryGate.js";
 import { getSenderDomainReadiness } from "./senderVerification.js";
 
 const SUPPORTED_PROVIDERS = new Set(["resend", "postmark"]);
@@ -143,7 +144,7 @@ export function getProviderReadiness(db, companyId, config = {}) {
     reasons,
     providerConnectionVerified: false,
     sendingAuthorized: false,
-    deliveryEnabled: false,
+    deliveryEnabled: isRealDeliveryEnabled(),
     emailsSent: 0,
   };
 }
