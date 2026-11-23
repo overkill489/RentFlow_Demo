@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, rmdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { recoverDeliveryQueue } from "./deliveryQueueRecovery.js";
@@ -268,6 +268,68 @@ test("Healthy pending queue entry is preserved", () => {
     db.close();
   }
 });
+
+test("Healthy recovery can run while another connection holds the writer lock", (t) => {
+  const { db, writer } = openConcurrentFixture(t);
+  seed(db);
+  writer.exec("BEGIN IMMEDIATE");
+  writer.exec(
+    "INSERT INTO recipient_suppressions VALUES ('company-b', 'recovery@example.test')",
+  );
+
+  const result = recover(db);
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.healthy, 1);
+  assert.equal(getQueue(db).status, "pending_review");
+  writer.exec("COMMIT");
+  assert.equal(recover(db).healthy, 1);
+});
+
+test("Recovery rechecks cancellation under the writer lock", (t) => {
+  const { db, writer } = openConcurrentFixture(t);
+  seed(db, { suppressed: true });
+
+  const exec = db.exec.bind(db);
+  let reachedWritePhase = false;
+  db.exec = (sql) => {
+    if (sql === "BEGIN IMMEDIATE") {
+      assert.equal(db.isTransaction, false);
+      reachedWritePhase = true;
+      writer.exec(
+        "DELETE FROM recipient_suppressions WHERE company_id = 'company-a'",
+      );
+    }
+    return exec(sql);
+  };
+
+  const result = recover(db);
+
+  assert.equal(reachedWritePhase, true);
+  assert.equal(result.scanned, 1);
+  assert.equal(result.healthy, 1);
+  assert.equal(result.cancelled, 0);
+  assert.equal(result.entries.length, 1);
+  assert.equal(getQueue(db).status, "pending_review");
+  assert.equal(getDraft(db).status, "draft");
+});
+
+function openConcurrentFixture(t) {
+  const directory = mkdtempSync(join(tmpdir(), "rentflow-contention-"));
+  const path = join(directory, "test.db");
+  const db = createDatabase(path);
+  const writer = new DatabaseSync(path, { timeout: 0 });
+  db.exec("PRAGMA busy_timeout = 0");
+
+  t.after(() => {
+    writer.close();
+    db.close();
+    unlinkSync(path);
+    rmdirSync(directory);
+  });
+
+  return { db, writer };
+}
 
 test("Valid future reminder remains pending", () => {
   const db = createDatabase();

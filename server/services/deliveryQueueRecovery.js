@@ -55,17 +55,6 @@ export function recoverDeliveryQueue(
       AND status = 'draft'
   `);
 
-  const result = {
-    mode: dryRun ? "dry-run" : "recovery",
-    processingTime: now,
-    scanned: 0,
-    healthy: 0,
-    cancelled: 0,
-    draftsCancelled: 0,
-    emailsSent: 0,
-    ...(includeEntries ? { entries: [] } : {}),
-  };
-
   function inspect(entry) {
     if (!entry.messageId || !entry.quoteId || !entry.companyId) {
       return {
@@ -121,10 +110,18 @@ export function recoverDeliveryQueue(
     };
   }
 
-  function performRecovery() {
+  function performRecovery(allowWrites) {
     const entries = findActiveEntries.all();
-
-    result.scanned = entries.length;
+    const result = {
+      mode: dryRun ? "dry-run" : "recovery",
+      processingTime: now,
+      scanned: entries.length,
+      healthy: 0,
+      cancelled: 0,
+      draftsCancelled: 0,
+      emailsSent: 0,
+      ...(includeEntries ? { entries: [] } : {}),
+    };
 
     for (const entry of entries) {
       const decision = inspect(entry);
@@ -132,6 +129,10 @@ export function recoverDeliveryQueue(
       if (decision.action === "keep") {
         result.healthy += 1;
       } else if (!dryRun) {
+        if (!allowWrites) {
+          return null;
+        }
+
         const update = cancelEntry.run(now, entry.queueId);
 
         if (update.changes === 1) {
@@ -153,22 +154,27 @@ export function recoverDeliveryQueue(
         reason: decision.reason,
       });
     }
-  }
 
-  if (dryRun) {
-    performRecovery();
     return result;
   }
 
-  db.exec("BEGIN IMMEDIATE");
+  function recoverInTransaction(allowWrites) {
+    db.exec(allowWrites ? "BEGIN IMMEDIATE" : "BEGIN");
 
-  try {
-    performRecovery();
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
+    try {
+      const result = performRecovery(allowWrites);
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
-  return result;
+  if (dryRun) {
+    return performRecovery(false);
+  }
+
+  // End the read snapshot before taking the writer lock and rechecking current state.
+  return recoverInTransaction(false) ?? recoverInTransaction(true);
 }
