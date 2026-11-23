@@ -10,6 +10,8 @@ import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import jwt from "jsonwebtoken";
+import { createOperations } from "./operations.js";
+import { startDeliveryQueueScheduler } from "./jobs/startDeliveryQueueScheduler.js";
 
 const directory = mkdtempSync(join(tmpdir(), "rentflow-http-"));
 const originalDb = new URL("./database/db.js", import.meta.url).href;
@@ -58,7 +60,18 @@ for (const company of ["a", "b"]) {
     .run(`queue-${company}`, `draft-${company}`, date, date);
 }
 
-const server = createApp().listen(0, "127.0.0.1");
+const observabilityLines = [];
+let now = 0;
+const operations = createOperations({
+  clock: () => now,
+  probe: () => db.prepare("SELECT 1 FROM companies LIMIT 1").get(),
+  logger: {
+    log: (line) => observabilityLines.push(line),
+    error: (line) => observabilityLines.push(line),
+  },
+});
+const metricsToken = randomUUID() + randomUUID();
+const server = createApp({ operations, metricsToken }).listen(0, "127.0.0.1");
 await once(server, "listening");
 after(async () => {
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -227,13 +240,81 @@ test("public unsubscribe GET and HEAD disclose no tenant records and POST affect
 test("a temporary authentication database failure is a server error, not an invalid session", async () => {
   const lock = new DatabaseSync(join(directory, "storage", "rentflow.db"));
   const bearer = token();
+  const probeFailures = operations.snapshot().databaseProbeFailures;
   try {
     lock.exec("BEGIN EXCLUSIVE");
+    assert.equal((await request("GET", "/health/live")).status, 200);
+    const readiness = await request("GET", "/health/ready");
+    assert.equal(readiness.status, 503);
+    assert.deepEqual(readiness.data, { status: "not_ready" });
+    assert.equal(operations.snapshot().databaseProbeFailures, probeFailures + 1);
     const result = await request("GET", "/auth/me", bearer);
     assert.equal(result.status, 500);
     assert.equal(result.data.error, "Internal server error");
   } finally {
     lock.close();
   }
+  assert.equal((await request("GET", "/health/ready")).status, 200);
   assert.equal((await request("GET", "/auth/me", bearer)).status, 200);
+});
+
+test("metrics require the separate token and request errors are counted with bounded redacted logs", async () => {
+  assert.equal((await request("GET", "/metrics")).status, 401);
+  const bearer = token();
+  assert.equal((await request("GET", "/metrics", bearer)).status, 401);
+  const before = await request("GET", "/metrics", metricsToken);
+  assert.equal(before.status, 200);
+  assert.equal(before.headers.get("cache-control"), "no-store");
+  now += 60000;
+  const start = observabilityLines.length;
+  const lock = new DatabaseSync(join(directory, "storage", "rentflow.db"));
+  try {
+    lock.exec("BEGIN IMMEDIATE");
+    for (let i = 0; i < 14; i++) {
+      const { status } = await request("POST", "/unsubscribe/synthetic-secret-in-path", bearer, {
+        message: "synthetic customer email@example.test", providerKey: "synthetic-provider-key",
+      });
+      assert.equal(status, 500);
+    }
+  } finally {
+    lock.close();
+  }
+  const afterMetrics = (await request("GET", "/metrics", metricsToken)).data;
+  assert.equal(afterMetrics.requests.serverErrors - before.data.requests.serverErrors, 14);
+  assert.equal(afterMetrics.errors.sqliteBusy - before.data.errors.sqliteBusy, 14);
+  assert.equal(afterMetrics.errors.suppressedLogs - before.data.errors.suppressedLogs, 2);
+  assert.equal(observabilityLines.length - start, 12);
+  for (const line of observabilityLines.slice(start)) {
+    assert.deepEqual(Object.keys(JSON.parse(line)).sort(), ["event", "reason", "time"]);
+    assert.equal(JSON.parse(line).reason, "sqlite_busy");
+  }
+  assert.doesNotMatch(JSON.stringify({ observabilityLines, afterMetrics }),
+    /synthetic-secret|synthetic-provider|email@example\.test|rentflow\.db|BEGIN IMMEDIATE/);
+  assert.ok(!observabilityLines.some((line) => line.includes(bearer) || line.includes(metricsToken)));
+});
+
+test("readiness detects a stalled child, recovers after success and goes unready during shutdown", async (t) => {
+  let finish;
+  const pending = new Promise((resolve) => { finish = resolve; });
+  const scheduler = startDeliveryQueueScheduler({ operations, runJob: () => pending });
+  t.after(() => scheduler.stop());
+  const originalWrites = db.prepare("SELECT total_changes() AS count").get().count;
+  assert.equal((await request("GET", "/health/ready")).status, 200);
+  const check = scheduler.checkNow();
+  now += 40000;
+  assert.equal((await request("GET", "/health/live")).status, 200);
+  assert.equal((await request("GET", "/health/ready")).status, 503);
+  const metrics = (await request("GET", "/metrics", metricsToken)).data;
+  assert.equal(metrics.workers.reconcile.status, "stalled");
+  assert.equal(metrics.workers.reconcile.runs, 1);
+
+  finish({ scanned: 0, healthy: 0, cancelled: 0, draftsCancelled: 0 });
+  assert.equal(await check, true);
+  assert.equal((await request("GET", "/health/ready")).status, 200);
+  operations.beginShutdown();
+  scheduler.stop();
+  assert.equal((await request("GET", "/health/live")).status, 200);
+  assert.equal((await request("GET", "/health/ready")).status, 503);
+  assert.equal(await scheduler.checkNow(), false);
+  assert.equal(db.prepare("SELECT total_changes() AS count").get().count, originalWrites);
 });

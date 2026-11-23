@@ -1,5 +1,5 @@
 import process from "node:process";
-import { db } from "../database/db.js";
+import { errorKind } from "../operations.js";
 import { processDueFollowUps, processDueFollowUpsInBatches } from "./dueFollowUpProcessor.js";
 import { queueDueDrafts, queueDueDraftsInBatches } from "../services/queueDueDrafts.js";
 
@@ -18,7 +18,9 @@ const processingTime = atArgument
   ? atArgument.slice(5)
   : new Date().toISOString();
 
+let db;
 try {
+  ({ db } = await import("../database/db.js"));
   db.exec("PRAGMA busy_timeout = 5000");
 
   const followUps = dryRun
@@ -43,8 +45,8 @@ try {
 
   console.log(JSON.stringify(result, null, 2));
 } catch (error) {
-  console.error(error);
+  console.error(JSON.stringify({ event: "worker_error", reason: errorKind(error) }));
   process.exitCode = 1;
 } finally {
-  db.close();
+  db?.close();
 }

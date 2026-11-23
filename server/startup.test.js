@@ -26,6 +26,7 @@ function fixture() {
       RENTFLOW_SQLITE_JOURNAL_MODE: "",
       RENTFLOW_SQLITE_BUSY_TIMEOUT_MS: "0",
       RENTFLOW_TRUST_LOOPBACK_PROXY: "0",
+      RENTFLOW_METRICS_TOKEN: "",
       PORT: "0",
       DOTENV_CONFIG_PATH: join(directory, "no-env-file"),
     },
@@ -45,6 +46,7 @@ test("invalid startup settings leave the SQLite fixture byte-for-byte empty", ()
     [{ JWT_SECRET: "invalid" }, /JWT_SECRET must contain/],
     [{ PORT: "invalid" }, /PORT must be an integer/],
     [{ RENTFLOW_TRUST_LOOPBACK_PROXY: "true" }, /must be 0 or 1/],
+    [{ RENTFLOW_METRICS_TOKEN: "invalid" }, /must be a separate/],
   ]) {
     const result = rejectStartup(directory, { ...env, ...settings });
     assert.equal(result.status, 1, result.stderr);
@@ -98,8 +100,10 @@ async function boot(t, directory, env) {
   const listening = new Promise((resolve) => {
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
-      const match = stdout.match(/RentFlow API running on (http:\/\/127\.0\.0\.1:\d+)/);
-      if (match && stdout.includes("[RentFlow Scheduler] Checked")) resolve(match[1]);
+      const match = stdout.match(/"event":"api_listening","port":(\d+)/);
+      if (match && stdout.includes('"event":"worker_succeeded","worker":"due"')) {
+        resolve(`http://127.0.0.1:${match[1]}`);
+      }
     });
   });
   const url = await Promise.race([
@@ -111,7 +115,9 @@ async function boot(t, directory, env) {
     async stop() {
       child.send("stop");
       assert.deepEqual(await exit, [0, null], stderr);
-      assert.doesNotMatch(stderr, /Check failed|Reconciliation failed/);
+      assert.doesNotMatch(stderr, /"event":"worker_failed"/);
+      assert.match(stdout, /"event":"shutdown_started"/);
+      assert.match(stdout, /"event":"http_drain_complete"/);
     },
   };
 }
@@ -120,6 +126,9 @@ test("production stops cleanly and restarts with persisted rows through the guar
   const { directory, database, env } = fixture();
   const first = await boot(t, directory, env);
   assert.equal((await fetch(first.url + "/api/health")).status, 200);
+  assert.equal((await fetch(first.url + "/api/health/live")).status, 200);
+  assert.equal((await fetch(first.url + "/api/health/ready")).status, 200);
+  assert.equal((await fetch(first.url + "/api/metrics")).status, 404);
   const registration = await fetch(first.url + "/api/auth/register", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

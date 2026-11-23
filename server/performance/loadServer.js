@@ -151,24 +151,19 @@ if (mode === "seed") {
   if (apiTimeout === 250) db.exec("PRAGMA busy_timeout = 250");
   assert.equal(db.prepare("PRAGMA busy_timeout").get().timeout, apiTimeout);
   const delay = monitorEventLoopDelay({ resolution: 10 });
-  let busy = 0;
-  let locked = 0;
   let peakRss = 0;
   let peakHeap = 0;
-  let unexpected = 0;
+  let baseline;
   const requests = new AsyncLocalStorage();
   const takeProfile = profileTransactions(db, () => requests.getStore() ?? "outside HTTP");
-  console.error = (error) => {
-    if ((error?.errcode & 255) === 5) busy++;
-    else if ((error?.errcode & 255) === 6) locked++;
-    else unexpected++;
-  };
+  console.error = () => {};
   const sampleMemory = () => {
     const { rss, heapUsed } = process.memoryUsage();
     peakRss = Math.max(peakRss, rss);
     peakHeap = Math.max(peakHeap, heapUsed);
   };
   const app = createApp();
+  const snapshot = app.locals.operations.snapshot;
   const server = createServer((req, res) => {
     const route = req.url.replace(/QT-\d+/g, ":id");
     requests.run(`${req.method} ${route}`, () => app(req, res));
@@ -183,7 +178,8 @@ if (mode === "seed") {
 
   process.on("message", (command) => {
     if (command === "reset") {
-      busy = locked = unexpected = peakRss = peakHeap = 0;
+      baseline = snapshot();
+      peakRss = peakHeap = 0;
       delay.enable();
       delay.reset();
       takeProfile();
@@ -192,6 +188,10 @@ if (mode === "seed") {
     } else if (command === "metrics") {
       sampleMemory();
       delay.disable();
+      const { errors, requests } = snapshot();
+      const busy = errors.sqliteBusy - baseline.errors.sqliteBusy;
+      const locked = errors.sqliteLocked - baseline.errors.sqliteLocked;
+      const unexpected = requests.serverErrors - baseline.requests.serverErrors - busy - locked;
       process.send({
         busy, locked, unexpected, peakRss, peakHeap, samples: delay.count,
         lagP95: delay.percentile(95) / 1e6, lagP99: delay.percentile(99) / 1e6,
