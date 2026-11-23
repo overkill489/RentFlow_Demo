@@ -37,7 +37,11 @@ export function openRentFlowDatabase(defaultPath, env = process.env) {
   const mode = env.RENTFLOW_SQLITE_JOURNAL_MODE;
   const configuredPath = env.RENTFLOW_SQLITE_PATH;
   const useWal = mode === "wal";
+  const timeout = env.RENTFLOW_SQLITE_BUSY_TIMEOUT_MS ?? "0";
 
+  if (!/^(?:0|[1-9]\d{0,2})$/.test(timeout) || Number(timeout) > 100) {
+    throw new Error("RENTFLOW_SQLITE_BUSY_TIMEOUT_MS must be a whole number from 0 to 100");
+  }
   if (mode && !useWal) {
     throw new Error("RENTFLOW_SQLITE_JOURNAL_MODE must be unset or wal");
   }
@@ -64,7 +68,7 @@ export function openRentFlowDatabase(defaultPath, env = process.env) {
   }
   if (useWal) validateWalStorage(path, process.platform);
 
-  const db = new DatabaseSync(path);
+  const db = new DatabaseSync(path, { timeout: Number(timeout) });
   if (!useWal) return db;
 
   try {

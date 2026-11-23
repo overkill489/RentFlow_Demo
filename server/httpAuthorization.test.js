@@ -19,6 +19,7 @@ copyFileSync(new URL(originalDb), fixturePath);
 const fixtureDb = pathToFileURL(fixturePath).href;
 delete process.env.RENTFLOW_SQLITE_PATH;
 delete process.env.RENTFLOW_SQLITE_JOURNAL_MODE;
+delete process.env.RENTFLOW_SQLITE_BUSY_TIMEOUT_MS;
 
 // Run the real bootstrap with its file path anchored in the temporary directory.
 const hooks = registerHooks({

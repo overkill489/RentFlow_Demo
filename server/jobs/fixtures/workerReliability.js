@@ -10,8 +10,9 @@ import { processDueFollowUps } from "../dueFollowUpProcessor.js";
 import { queueDueDrafts } from "../../services/queueDueDrafts.js";
 import { runDeliveryQueueAction } from "../../services/deliveryQueueLifecycle.js";
 import { recoverDeliveryQueue } from "../../services/deliveryQueueRecovery.js";
+import { confirmUnsubscribe } from "../../services/unsubscribeService.js";
 
-const [directory, mode, checkpoint, gate] = process.argv.slice(2);
+const [directory, mode, checkpoint, gate, token] = process.argv.slice(2);
 const now = "2025-02-01T00:00:00.000Z";
 const due = "2025-01-01T00:00:00.000Z";
 const secret = "rentflow-http-fixture-secret-only-for-this-temporary-database";
@@ -19,6 +20,7 @@ process.env.JWT_SECRET = secret;
 process.env.RENTFLOW_UNSUBSCRIBE_BASE_URL = "http://localhost:5000";
 delete process.env.RENTFLOW_SQLITE_PATH;
 delete process.env.RENTFLOW_SQLITE_JOURNAL_MODE;
+delete process.env.RENTFLOW_SQLITE_BUSY_TIMEOUT_MS;
 
 async function loadApp() {
   const originalDb = new URL("../../database/db.js", import.meta.url).href;
@@ -116,6 +118,8 @@ if (mode === "setup" || mode === "manual") {
       result = { drafts, queue };
     } else if (mode === "reconcile") {
       result = recoverDeliveryQueue(db, { currentTime: now, includeEntries: false });
+    } else if (mode === "unsubscribe") {
+      result = confirmUnsubscribe(db, token, now);
     } else {
       const queueId = db.prepare(`SELECT dq.id FROM delivery_queue dq
                                  JOIN outbound_messages m ON m.id = dq.message_id

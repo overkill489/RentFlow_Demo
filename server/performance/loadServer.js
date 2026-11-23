@@ -35,8 +35,10 @@ const past = "2025-01-06T16:00:00.000Z";
 const future = "2099-01-05T16:00:00.000Z";
 const journalMode = process.env.RENTFLOW_LOAD_JOURNAL;
 const apiTimeout = Number(process.env.RENTFLOW_LOAD_API_TIMEOUT);
+const workerTimeout = Number(process.env.RENTFLOW_LOAD_WORKER_TIMEOUT);
 assert.ok(["delete", "wal"].includes(journalMode));
-assert.ok([0, 250].includes(apiTimeout));
+assert.ok([0, 25, 50, 100, 250].includes(apiTimeout));
+assert.ok([0, 500, 5000].includes(workerTimeout));
 
 function seed(quotes, companies) {
   const started = performance.now();
@@ -104,7 +106,7 @@ if (mode === "seed") {
   db.close();
   process.disconnect();
 } else if (mode === "workers" || mode === "recovery") {
-  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec(`PRAGMA busy_timeout = ${workerTimeout}`);
   const exec = db.exec.bind(db);
   let began;
   let holdMs = 0;
@@ -125,19 +127,23 @@ if (mode === "seed") {
   };
   process.send({ ready: true });
   await once(process, "message");
+  const results = {};
+  let phase = "idleRecovery";
   try {
     if (mode === "recovery") {
       process.send(Array.from({ length: 6 }, () =>
         measure(() => recoverDeliveryQueue(db, { includeEntries: false }))));
     } else {
-      process.send({
-        due: measure(() => processDueFollowUps(db, new Date().toISOString())),
-        queue: measure(() => queueDueDrafts(db)),
-        recovery: measure(() => recoverDeliveryQueue(db, { includeEntries: false })),
-      });
+      phase = "due";
+      results.due = measure(() => processDueFollowUps(db, new Date().toISOString()));
+      phase = "queue";
+      results.queue = measure(() => queueDueDrafts(db));
+      phase = "recovery";
+      results.recovery = measure(() => recoverDeliveryQueue(db, { includeEntries: false }));
+      process.send(results);
     }
   } catch (error) {
-    process.send({ workerError: error.errcode ?? error.message });
+    process.send({ ...results, workerPhase: phase, workerError: error.errcode ?? error.message });
   } finally {
     db.close();
     process.disconnect();
@@ -145,14 +151,17 @@ if (mode === "seed") {
 } else if (mode === "http") {
   assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, journalMode);
   assert.equal(db.prepare("PRAGMA synchronous").get().synchronous, 2);
-  db.exec(`PRAGMA busy_timeout = ${apiTimeout}`);
+  if (apiTimeout === 250) db.exec("PRAGMA busy_timeout = 250");
+  assert.equal(db.prepare("PRAGMA busy_timeout").get().timeout, apiTimeout);
   const delay = monitorEventLoopDelay({ resolution: 10 });
   let busy = 0;
+  let locked = 0;
   let peakRss = 0;
   let peakHeap = 0;
   let unexpected = 0;
   console.error = (error) => {
-    if ([5, 6].includes(error?.errcode & 255)) busy++;
+    if ((error?.errcode & 255) === 5) busy++;
+    else if ((error?.errcode & 255) === 6) locked++;
     else unexpected++;
   };
   const sampleMemory = () => {
@@ -171,7 +180,7 @@ if (mode === "seed") {
 
   process.on("message", (command) => {
     if (command === "reset") {
-      busy = unexpected = peakRss = peakHeap = 0;
+      busy = locked = unexpected = peakRss = peakHeap = 0;
       delay.enable();
       delay.reset();
       sampleMemory();
@@ -180,7 +189,7 @@ if (mode === "seed") {
       sampleMemory();
       delay.disable();
       process.send({
-        busy, unexpected, peakRss, peakHeap, samples: delay.count,
+        busy, locked, unexpected, peakRss, peakHeap, samples: delay.count,
         lagP95: delay.percentile(95) / 1e6, lagP99: delay.percentile(99) / 1e6,
         lagMax: delay.max / 1e6,
       });

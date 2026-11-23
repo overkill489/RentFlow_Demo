@@ -8,11 +8,12 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { startDeliveryQueueScheduler } from "./startDeliveryQueueScheduler.js";
+import { createUnsubscribeToken } from "../services/unsubscribeService.js";
 
 const worker = fileURLToPath(new URL("./fixtures/workerReliability.js", import.meta.url));
 
-function start(t, directory, mode, checkpoint = "", gate = "") {
-  const child = fork(worker, [directory, mode, checkpoint, gate], {
+function start(t, directory, mode, checkpoint = "", gate = "", token = "") {
+  const child = fork(worker, [directory, mode, checkpoint, gate, token], {
     stdio: ["ignore", "ignore", "pipe", "ipc"],
     windowsHide: true,
     timeout: 15000,
@@ -142,8 +143,15 @@ test("overlapping due workers replay a crash between the draft and queue commits
 test("approval races and a crashed simulation preserve status, attempts and audit", async (t) => {
   const { directory, db } = await fixture(t);
   await start(t, directory, "due").finish();
-  const first = start(t, directory, "approve");
-  const second = start(t, directory, "approve");
+  const firstGate = join(directory, "approval-commit");
+  const secondGate = join(directory, "approval-begin");
+  const first = start(t, directory, "approve", "before-commit", firstGate);
+  await first.checkpoint("before-commit");
+  const second = start(t, directory, "approve", "before-begin", secondGate);
+  await second.checkpoint("before-begin");
+  assert.equal(queued(db).status, "pending_review");
+  writeFileSync(secondGate, "");
+  writeFileSync(firstGate, "");
   const responses = await Promise.all([first.finish(), second.finish()]);
   assert.deepEqual(responses.map(({ statusCode }) => statusCode).sort(), [200, 409]);
   assert.equal(queued(db).approvedBy, "admin-a");
@@ -164,6 +172,37 @@ test("approval races and a crashed simulation preserve status, attempts and audi
   assert.equal(queued(db, "quote-b").status, "pending_review");
   assert.equal(count(db, "delivery_attempts"), 1);
   assert.equal(count(db, "delivery_queue_audit", "event_type = 'simulated' AND actor_id = 'admin-a'"), 1);
+});
+
+test("concurrent unsubscribe consumes the token once and cannot cancel another tenant's queue", async (t) => {
+  const { directory, db } = await fixture(t);
+  db.exec("PRAGMA journal_mode = WAL");
+  await start(t, directory, "due").finish();
+  assert.equal((await start(t, directory, "approve").finish()).statusCode, 200);
+  const { token } = createUnsubscribeToken(db, {
+    companyId: "a", quoteId: "quote-a", currentTime: "2025-01-24T00:00:00.000Z",
+  });
+  const writerGate = join(directory, "unsubscribe-commit");
+  const contenderGate = join(directory, "unsubscribe-begin");
+  const first = start(t, directory, "unsubscribe", "before-commit", writerGate, token);
+  await first.checkpoint("before-commit");
+  const second = start(t, directory, "unsubscribe", "before-begin", contenderGate, token);
+  await second.checkpoint("before-begin");
+  assert.equal(queued(db).status, "approved");
+  assert.equal(count(db, "unsubscribe_tokens", "used_at IS NOT NULL"), 0);
+  writeFileSync(contenderGate, "");
+  writeFileSync(writerGate, "");
+
+  assert.equal((await first.finish()).success, true);
+  assert.deepEqual(await second.finish(), { success: false, reason: "ALREADY_USED" });
+  assert.equal((await start(t, directory, "reconcile").finish()).cancelled, 0);
+  assert.equal(count(db, "unsubscribe_tokens", "used_at IS NOT NULL"), 1);
+  assert.equal(count(db, "recipient_suppressions", "company_id = 'a'"), 1);
+  assert.equal(count(db, "recipient_suppressions", "company_id = 'b'"), 0);
+  assert.equal(count(db, "delivery_queue_audit", "event_type = 'approved'"), 1);
+  assert.equal(count(db, "delivery_queue_audit", "event_type = 'cancelled'"), 1);
+  assert.equal(queued(db).status, "cancelled");
+  assert.equal(queued(db, "quote-b").status, "pending_review");
 });
 
 test("scheduler ticks skip local overlap and two live reconcilers cancel only once", async (t) => {

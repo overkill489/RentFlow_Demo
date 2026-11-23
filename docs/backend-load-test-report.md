@@ -120,3 +120,42 @@ Each HTTP failure was a 500 associated with a busy error. WAL at 0 ms eliminated
 Every worker run recorded 5,000 due events, added 1,000 drafts and 1,000 queue entries, and reconciled 11,000 healthy entries without cancellations or email sends. Final integrity and foreign-key checks passed in all three configurations. Each fixture contained 11,000 active drafts, 11,000 pending queue entries, 11,000 queued audit events and zero attempts. A separate process test verified that a WAL reader can proceed while a writer owns the lock and that a second writer still receives `SQLITE_BUSY` at zero timeout. [Connection and process tests](../server/database/openDatabase.test.js)
 
 The results support a guarded single-host WAL pilot on verified local storage. They do not qualify the two-API topology for production, which still needs a contention strategy and agreed latency targets. See the [rollout and rollback procedure](database-hardening-plan.md#guarded-wal-configuration-and-rollout--2026-11-23).
+
+## Bounded busy-timeout sweep · 2026-11-23
+
+The current harness can skip the single-API phase with `--two-only`. Each case starts from a fresh local NTFS fixture with 100 companies, 100,000 tenant quotes and contacts, and 10,000 initial queue entries. The two phases use the same request mix, 16 concurrent clients and 1,600 measured requests each. The worker starts with the second phase. FULL synchronous durability, foreign keys and the existing transaction logic stay in place. The shared connection opener applies waits through 100 ms to the HTTP test processes. The worker override is for the harness only.
+
+```powershell
+foreach ($rentflowWait in 0, 25, 50, 100) {
+  node server/performance/backendLoad.js --two-only --journal=wal "--api-timeout=$rentflowWait" --worker-timeout=5000
+}
+foreach ($rentflowWait in 0, 50) {
+  node server/performance/backendLoad.js --two-only --journal=delete "--api-timeout=$rentflowWait" --worker-timeout=5000
+}
+node server/performance/backendLoad.js --two-only --journal=wal --api-timeout=50 --worker-timeout=500
+# Diagnostic run. The final assertion fails if the non-waiting worker leaves work pending.
+node server/performance/backendLoad.js --two-only --journal=wal --api-timeout=50 --worker-timeout=0
+```
+
+| Journal / API wait / worker wait (ms) | Without worker busy / 1,600 | Without worker attempt / successful RPS | Without worker p95 / p99 (ms) | With worker busy / 1,600 | With worker attempt / successful RPS | With worker p95 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| WAL / 0 / 5,000 | 162 (10.13%) | 179.87 / 161.66 | 245.50 / 302.79 | 174 (10.88%) | 178.07 / 158.70 | 251.32 / 298.98 |
+| WAL / 25 / 5,000 | 0 | 183.21 / 183.21 | 248.16 / 267.25 | 11 (0.69%) | 173.15 / 171.96 | 254.13 / 280.45 |
+| WAL / 50 / 5,000 | 0 | 181.35 / 181.35 | 250.06 / 272.32 | 9 (0.56%) | 172.52 / 171.55 | 252.03 / 294.16 |
+| WAL / 100 / 5,000 | 0 | 177.68 / 177.68 | 252.26 / 275.98 | 5 (0.31%) | 167.37 / 166.85 | 255.44 / 380.29 |
+| DELETE / 0 / 5,000 | 246 (15.38%) | 175.72 / 148.70 | 251.64 / 289.92 | 303 (18.94%) | 176.13 / 142.78 | 257.75 / 286.15 |
+| DELETE / 50 / 5,000 | 0 | 124.43 / 124.43 | 295.20 / 374.77 | 10 (0.63%) | 118.39 / 117.65 | 313.41 / 499.76 |
+| WAL / 50 / 500 | 0 | 183.42 / 183.42 | 244.76 / 262.96 | 9 (0.56%) | 168.13 / 167.18 | 257.85 / 306.94 |
+| WAL / 50 / 0, diagnostic rerun | 0 | 180.99 / 180.99 | 246.64 / 269.65 | 4 (0.25%) | 175.72 / 175.28 | 247.26 / 277.87 |
+
+On the final application setting, repeating WAL at 25 ms produced **0 busy errors without the worker** at 181.85 RPS and p95/p99 of 249.44/269.52 ms. With the worker it produced **10 of 1,600 busy errors** at 176.51 attempted and approximately 175.41 successful RPS, with p95/p99 of 245.47/269.30 ms. SQLite integrity and foreign-key checks passed. The database contained all 11,000 expected active drafts, queue items and queue audits. The stored 323 quote creations and 487 scheduling activities matched successful HTTP responses including warm-up. The harness reports busy and locked errors separately. The confirmation logged zero `SQLITE_LOCKED` errors.
+
+A second confirmation again produced 0 busy errors without the worker and 10 with it. Attempted throughput was 180.20 and 167.78 RPS, respectively. The p95/p99 pairs were 248.78/274.61 ms and 255.57/312.14 ms. The stored counts matched the first confirmation.
+
+The 25 ms wait is the first candidate for a WAL staging pilot because it substantially reduced failures with similar p95 and stronger goodput in the measured mix. The 50 ms and 100 ms cases traded additional synchronous waiting for smaller reductions in errors. DELETE waiting also reduced busy errors, with lower goodput and materially higher tail latency. These are local runs. Worker and API timing varies with scheduling, and the measurements do not establish a production latency or reliability guarantee.
+
+With the 500 ms worker wait, all three worker stages completed in that run. With zero wait, `SQLITE_BUSY` interrupted the worker between its draft and queue commits. Integrity passed and 1,000 new drafts were durable, while the 1,000 associated queue items and audit events were still absent. The harness correctly returned nonzero for the incomplete pass. The API error count alone would have missed that outcome. The application retains the existing 5,000 ms worker wait and the later scheduler tick can replay the eligible draft-to-queue phase. The independent-process regression suite also covers approval, draft creation, unsubscribe, recovery and crash replay without duplicate transition or audit rows. [Worker tests](../server/jobs/workerReliability.test.js) · [Configuration tests](../server/database/openDatabase.test.js)
+
+Production timeouts, journal mode and deployment were not changed. The [bounded wait and retry policy](database-hardening-plan.md#bounded-sqlite-lock-waiting--2026-11-23) documents the opt-in, safe boundaries and remaining risks.
+
+Backend verification on Node v24.22.3 from `server/` with `node --test --test-reporter=spec` yielded **210 passed, 0 failed, 0 skipped, 0 cancelled**. The focused connection and independent-process suites yielded **14 passed, 0 failed, 0 skipped, 0 cancelled**.

@@ -43,6 +43,46 @@ test("Default database path preserves DELETE configuration and creates only the 
   }
 });
 
+test("SQLite busy timeout is validated before opening and is independent of journal mode", () => {
+  const path = join(fixture(), "database.db");
+  for (const value of ["", "-1", "1.5", "1e2", " 25", "101", "5000"]) {
+    assert.throws(() => openRentFlowDatabase(path, {
+      RENTFLOW_SQLITE_BUSY_TIMEOUT_MS: value,
+    }), /whole number from 0 to 100/);
+  }
+  assert.equal(existsSync(path), false);
+  const db = openRentFlowDatabase(path, { RENTFLOW_SQLITE_BUSY_TIMEOUT_MS: "25" });
+  try {
+    assert.equal(journal(db), "delete");
+    assert.equal(db.prepare("PRAGMA busy_timeout").get().timeout, 25);
+  } finally {
+    db.close();
+  }
+});
+
+test("A bounded wait expires at BEGIN without partial work and a new transaction can proceed", (t) => {
+  const path = join(fixture(), "database.db");
+  initialize(path);
+  const holder = openRentFlowDatabase(path, {});
+  const request = openRentFlowDatabase(path, { RENTFLOW_SQLITE_BUSY_TIMEOUT_MS: "25" });
+  t.after(() => {
+    request.close();
+    holder.close();
+  });
+  holder.exec("BEGIN IMMEDIATE; INSERT INTO operations VALUES (1)");
+
+  const start = performance.now();
+  assert.throws(() => request.exec("BEGIN IMMEDIATE"), { errcode: 5 });
+  assert.ok(performance.now() - start >= 15);
+  assert.equal(request.isTransaction, false);
+  assert.equal(request.prepare("SELECT COUNT(*) AS count FROM operations").get().count, 0);
+
+  holder.exec("COMMIT");
+  request.exec("BEGIN IMMEDIATE; INSERT INTO operations VALUES (2); COMMIT");
+  assert.deepEqual(request.prepare("SELECT id FROM operations ORDER BY id").all()
+    .map(({ id }) => id), [1, 2]);
+});
+
 test("WAL requires an existing absolute file and explicit local single-host confirmation", () => {
   const directory = fixture();
   const path = join(directory, "database.db");

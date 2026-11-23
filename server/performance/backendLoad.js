@@ -11,17 +11,21 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
-const stageArgs = args.filter((arg) => ["--quick", "--full-only"].includes(arg));
+const stageArgs = args.filter((arg) => ["--quick", "--full-only", "--two-only"].includes(arg));
 const journalArgs = args.filter((arg) => /^--journal=(delete|wal)$/.test(arg));
-const timeoutArgs = args.filter((arg) => /^--api-timeout=(0|250)$/.test(arg));
+const timeoutArgs = args.filter((arg) => /^--api-timeout=(0|25|50|100|250)$/.test(arg));
+const workerTimeoutArgs = args.filter((arg) => /^--worker-timeout=(0|500|5000)$/.test(arg));
 if (stageArgs.length > 1 || journalArgs.length > 1 || timeoutArgs.length > 1 ||
-    args.length !== stageArgs.length + journalArgs.length + timeoutArgs.length) {
-  throw new Error("Usage: node server/performance/backendLoad.js [--quick|--full-only] [--journal=delete|wal] [--api-timeout=0|250]");
+    workerTimeoutArgs.length > 1 ||
+    args.length !== stageArgs.length + journalArgs.length + timeoutArgs.length + workerTimeoutArgs.length) {
+  throw new Error("Usage: node server/performance/backendLoad.js [--quick|--full-only|--two-only] [--journal=delete|wal] [--api-timeout=0|25|50|100|250] [--worker-timeout=0|500|5000]");
 }
 const quick = args.includes("--quick");
-const full = args.includes("--full-only");
+const twoOnly = args.includes("--two-only");
+const full = args.includes("--full-only") || twoOnly;
 const journal = journalArgs[0]?.split("=")[1] ?? "delete";
 const apiTimeout = timeoutArgs[0]?.split("=")[1] ?? "0";
+const workerTimeout = workerTimeoutArgs[0]?.split("=")[1] ?? "5000";
 const stages = [
   { quotes: 1000, companies: 10, concurrency: 4, requests: 400 },
   { quotes: 10000, companies: 50, concurrency: 8, requests: 800 },
@@ -42,8 +46,10 @@ function start(directory, mode, { quotes, companies }) {
       RENTFLOW_SQLITE_JOURNAL_MODE: journal === "wal" ? "wal" : "",
       RENTFLOW_SQLITE_PATH: journal === "wal" ? join(directory, "storage", "rentflow.db") : "",
       RENTFLOW_SQLITE_STORAGE: journal === "wal" ? "local-single-host" : "",
+      RENTFLOW_SQLITE_BUSY_TIMEOUT_MS: mode === "http" && Number(apiTimeout) <= 100 ? apiTimeout : "0",
       RENTFLOW_LOAD_JOURNAL: journal,
       RENTFLOW_LOAD_API_TIMEOUT: apiTimeout,
+      RENTFLOW_LOAD_WORKER_TIMEOUT: workerTimeout,
     },
     stdio: ["ignore", "ignore", "inherit", "ipc"],
     windowsHide: true,
@@ -187,7 +193,7 @@ async function queryPlans(directory) {
   }
 }
 
-function verifyFixture(directory) {
+function verifyFixture(directory, successfulCreates, successfulSchedules) {
   const db = new DatabaseSync(join(directory, "storage", "rentflow.db"), { readOnly: true });
   try {
     const scalar = (sql) => Object.values(db.prepare(sql).get())[0];
@@ -199,11 +205,15 @@ function verifyFixture(directory) {
       activeQueue: scalar("SELECT COUNT(*) FROM delivery_queue WHERE status = 'pending_review'"),
       queuedAudit: scalar("SELECT COUNT(*) FROM delivery_queue_audit WHERE event_type = 'queued'"),
       attempts: scalar("SELECT COUNT(*) FROM delivery_attempts"),
+      createdViaHttp: scalar("SELECT COUNT(*) FROM quotes WHERE customer = 'Fictional load customer'"),
+      scheduledViaHttp: scalar(`SELECT COUNT(*) FROM activity_logs WHERE type = 'scheduling'
+        AND description IN ('Follow-up scheduled.', 'Follow-up rescheduled.')`),
     };
     print({ verification: result });
     assert.deepEqual(result, {
       integrity: "ok", foreignKeyErrors: 0, detected: 5000, drafts: 11000,
       activeQueue: 11000, queuedAudit: 11000, attempts: 0,
+      createdViaHttp: successfulCreates, scheduledViaHttp: successfulSchedules,
     });
   } finally {
     db.close();
@@ -234,6 +244,10 @@ async function load(directory, stage, name, replicas, withWorkers) {
     if (workers) await workers.done();
     print({ workload: name, replicas, ...result, metrics: metrics.map(({ peakRss, peakHeap, ...m }) =>
       ({ ...m, rssMiB: mib(peakRss), heapMiB: mib(peakHeap) })), workers: workerResults });
+    return {
+      creates: (warmup.endpoints.quoteCreate.status[201] ?? 0) + (result.endpoints.quoteCreate.status[201] ?? 0),
+      schedules: (warmup.endpoints.schedule.status[200] ?? 0) + (result.endpoints.schedule.status[200] ?? 0),
+    };
   } finally {
     await Promise.all(children.map((child) => child.stop(true)));
     if (workers) await workers.stop();
@@ -241,7 +255,8 @@ async function load(directory, stage, name, replicas, withWorkers) {
 }
 
 print({ node: process.version, platform: process.platform, cpu: cpus()[0]?.model,
-  availableParallelism: availableParallelism(), memoryMiB: mib(totalmem()) });
+  availableParallelism: availableParallelism(), memoryMiB: mib(totalmem()),
+  journal, apiTimeout: Number(apiTimeout), workerTimeout: Number(workerTimeout) });
 for (const stage of quick ? stages.slice(0, 1) : full ? stages.slice(2) : stages) {
   const directory = await mkdtemp(join(tmpdir(), "rentflow-backend-load-"));
   try {
@@ -259,18 +274,19 @@ for (const stage of quick ? stages.slice(0, 1) : full ? stages.slice(2) : stages
     const seeder = start(directory, "seed", stage);
     print({ stage, fixture: await seeder.ready });
     await seeder.done();
-    if (stage.quotes === 100000) {
+    if (stage.quotes === 100000 && !twoOnly) {
       await queryPlans(directory);
       const recovery = start(directory, "recovery", stage);
       await recovery.ready;
       print({ idleRecovery: await recovery.ask("run") });
       await recovery.done();
     }
-    await load(directory, stage, "single-api", 1, false);
+    const single = twoOnly ? { creates: 0, schedules: 0 } : await load(directory, stage, "single-api", 1, false);
     if (stage.quotes === 100000) {
-      await load(directory, stage, "two-api", 2, false);
-      await load(directory, stage, "two-api-with-workers", 2, true);
-      verifyFixture(directory);
+      const pair = await load(directory, stage, "two-api", 2, false);
+      const overlap = await load(directory, stage, "two-api-with-workers", 2, true);
+      verifyFixture(directory, single.creates + pair.creates + overlap.creates,
+        single.schedules + pair.schedules + overlap.schedules);
     }
   } finally {
     await rm(directory, { recursive: true, force: true });
