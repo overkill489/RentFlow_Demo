@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isMockMessageId } from "./mockDeliveryProtocol.js";
 
 export function createMockDeliveryTransport({
   respond = ({ idempotencyKey }) => Response.json({
@@ -17,24 +18,24 @@ export function createMockDeliveryTransport({
       return await Promise.race([
         new Promise((resolve) => {
           timer = setTimeout(() => {
-            resolve({ state: "uncertain" });
+            resolve({ state: "ambiguous", code: "TIMEOUT" });
             controller.abort();
           }, timeoutMs);
         }),
         Promise.resolve().then(async () => {
           const response = await respond(request, controller.signal);
           // The fake contract defines this as rejection before acceptance.
-          if (response.status === 429) return { state: "retryable" };
-          if (!response.ok) return { state: "uncertain" };
+          if (response.status === 429) return { state: "rejected", code: "RATE_LIMITED" };
+          if (!response.ok) return { state: "ambiguous", code: "UNCONFIRMED_RESPONSE" };
           const { id } = await response.json();
-          if (typeof id !== "string" || !/^mock-[a-zA-Z0-9_-]{1,120}$/.test(id)) {
-            return { state: "uncertain" };
+          if (!isMockMessageId(id)) {
+            return { state: "ambiguous", code: "UNCONFIRMED_RESPONSE" };
           }
           return { state: "accepted", providerMessageId: id };
         }),
       ]);
     } catch {
-      return { state: "uncertain" };
+      return { state: "ambiguous", code: "UNCONFIRMED_RESPONSE" };
     } finally {
       clearTimeout(timer);
     }

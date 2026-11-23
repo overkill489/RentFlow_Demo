@@ -1,24 +1,13 @@
 import { createHash } from "node:crypto";
+import { immediateTransaction } from "../database/immediateTransaction.js";
 import { isRealDeliveryEnabled } from "./deliveryGate.js";
 import { getDeliveryPreflight } from "./deliveryPreflight.js";
+import { DEFAULT_MOCK_ACCOUNT, isMockAccount, MOCK_PROVIDER } from "./mockDeliveryProtocol.js";
 import { createMockDeliveryTransport } from "./mockDeliveryTransport.js";
 import { getProviderReadiness } from "./providerReadiness.js";
 import { validateSenderIdentity } from "./senderIdentity.js";
 
 const MAX_ATTEMPTS = 3;
-const EVENT_TYPES = new Set(["delivered", "soft_bounce", "hard_bounce", "complaint"]);
-
-function transaction(db, work) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const result = work();
-    db.exec("COMMIT");
-    return result;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-}
 
 function digest(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -30,17 +19,29 @@ function isSingleMailbox(email) {
     email.split("@")[0].length <= 64;
 }
 
-function claim(db, options) {
-  return transaction(db, () => {
+function claim(db, account, options) {
+  return immediateTransaction(db, () => {
     const preflight = getDeliveryPreflight(db, options);
     if (!preflight) return { state: "not_found" };
 
     const { companyId, messageId } = preflight;
     const previous = db.prepare(`
-      SELECT state, attempts, payload_hash AS payloadHash
-      FROM mock_delivery_claims WHERE company_id = ? AND message_id = ?
+      SELECT d.id, d.state, d.idempotency_key AS idempotencyKey, d.payload_hash AS payloadHash,
+        d.provider, d.provider_account AS account,
+        (SELECT max(number) FROM email_delivery_attempts WHERE delivery_id = d.id) AS attempts
+      FROM email_deliveries d WHERE company_id = ? AND message_id = ?
     `).get(companyId, messageId);
-    if (previous && previous.state !== "retryable") return { state: previous.state };
+    if (previous && (previous.provider !== MOCK_PROVIDER || previous.account !== account)) {
+      return { state: "blocked" };
+    }
+    if (previous && previous.state !== "rejected") return { state: previous.state };
+    const now = new Date().toISOString();
+    if (previous && preflight.queueStatus === "cancelled") {
+      db.prepare("UPDATE email_deliveries SET state = 'cancelled', updated_at = ? WHERE id = ?")
+        .run(now, previous.id);
+      return { state: "cancelled" };
+    }
+    if (previous?.attempts >= MAX_ATTEMPTS) return { state: "rejected" };
     if (!preflight.technicalChecksPassed) return { state: "blocked" };
 
     const sender = getProviderReadiness(db, companyId, options.providerConfig);
@@ -68,70 +69,74 @@ function claim(db, options) {
     const payloadHash = digest([sender.provider, envelope]);
     if (previous && previous.payloadHash !== payloadHash) return { state: "blocked" };
 
-    const attempts = (previous?.attempts ?? 0) + 1;
+    const number = (previous?.attempts ?? 0) + 1;
+    const idempotencyKey = previous?.idempotencyKey ?? `mock-${digest([account, companyId, messageId])}`;
+    let id = previous?.id;
+    if (previous) {
+      db.prepare("UPDATE email_deliveries SET state = 'claimed', updated_at = ? WHERE id = ?").run(now, id);
+    } else {
+      id = db.prepare(`
+        INSERT INTO email_deliveries (
+          company_id, message_id, recipient, provider, provider_account, idempotency_key,
+          payload_hash, state, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)
+      `).run(companyId, messageId, recipient, MOCK_PROVIDER, account, idempotencyKey, payloadHash, now).lastInsertRowid;
+    }
     db.prepare(`
-      INSERT INTO mock_delivery_claims (company_id, message_id, recipient, payload_hash, state, attempts)
-      VALUES (?, ?, ?, ?, 'in_flight', ?)
-      ON CONFLICT (company_id, message_id) DO UPDATE
-        SET state = 'in_flight', attempts = excluded.attempts
-    `).run(companyId, messageId, recipient, payloadHash, attempts);
+      INSERT INTO email_delivery_attempts (delivery_id, number, claimed_at) VALUES (?, ?, ?)
+    `).run(id, number, now);
 
     return {
-      state: "claimed", companyId, messageId, attempts,
-      request: { idempotencyKey: `mock-${digest([companyId, messageId])}`, envelope },
+      state: "start", id, number, request: { idempotencyKey, envelope },
     };
   });
 }
 
-// Internal fixture workflow. The app does not install the mock ledger or call this function.
-export async function attemptDelivery(db, { mode, mock, ...options } = {}) {
-  if (mode !== "mock" && !isRealDeliveryEnabled()) return { state: "disabled" };
-  if (mode !== "mock") return { state: "unsupported" };
+function finish(db, account, { id, number }, outcome) {
+  return immediateTransaction(db, () => {
+    const delivery = db.prepare(`
+      SELECT state, provider_message_id AS providerMessageId FROM email_deliveries WHERE id = ?
+    `).get(id);
+    if (delivery.state !== "claimed") {
+      // An authenticated event may have proved acceptance while the response was pending.
+      if (outcome.providerMessageId && outcome.providerMessageId !== delivery.providerMessageId) {
+        return { state: "conflict" };
+      }
+      return { state: delivery.state };
+    }
 
-  const submit = createMockDeliveryTransport(mock);
-  const delivery = claim(db, options);
-  if (delivery.state !== "claimed") return delivery;
-
-  const outcome = await submit(delivery.request);
-  const state = outcome.state === "retryable" && delivery.attempts >= MAX_ATTEMPTS
-    ? "exhausted" : outcome.state;
-  const update = db.prepare(`
-    UPDATE mock_delivery_claims SET state = ?, provider_message_id = ?
-    WHERE company_id = ? AND message_id = ? AND state = 'in_flight' AND attempts = ?
-  `).run(state, outcome.providerMessageId ?? null, delivery.companyId, delivery.messageId, delivery.attempts);
-  if (update.changes !== 1) throw new Error("Mock delivery claim was lost");
-  return { state };
+    let { state, providerMessageId = null, code = null } = outcome;
+    if (providerMessageId && db.prepare(`
+      SELECT 1 FROM email_deliveries WHERE provider = ? AND provider_account = ? AND provider_message_id = ?
+    `).get(MOCK_PROVIDER, account, providerMessageId)) {
+      state = "ambiguous";
+      code = "UNCONFIRMED_RESPONSE";
+      providerMessageId = null;
+    }
+    const now = new Date().toISOString();
+    const update = db.prepare(`
+      UPDATE email_delivery_attempts SET finished_at = max(claimed_at, ?), outcome = ?, error_code = ?
+      WHERE delivery_id = ? AND number = ? AND finished_at IS NULL
+    `).run(now, state, code, id, number);
+    if (update.changes !== 1) throw new Error("Mock delivery attempt was lost");
+    db.prepare(`
+      UPDATE email_deliveries SET state = ?, provider_message_id = ?, updated_at = max(updated_at, ?)
+      WHERE id = ?
+    `).run(state, providerMessageId, now, id);
+    return { state };
+  });
 }
 
-// Accept only normalized events from a trusted adapter. No HTTP route is registered.
-export function recordVerifiedMockDeliveryEvent(db, {
-  eventId, providerMessageId, type, currentTime = new Date().toISOString(),
-}) {
-  if (typeof eventId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(eventId) ||
-      typeof providerMessageId !== "string" || !EVENT_TYPES.has(type)) {
-    return { state: "invalid" };
-  }
-  const now = new Date(currentTime).toISOString();
+// The application does not install the ledger or invoke this mock workflow.
+export async function attemptDelivery(db, { mode, mock, account = DEFAULT_MOCK_ACCOUNT, ...options } = {}) {
+  if (mode !== "mock" && !isRealDeliveryEnabled()) return { state: "disabled" };
+  if (mode !== "mock") return { state: "unsupported" };
+  if (!isMockAccount(account)) throw new Error("Invalid mock delivery account");
 
-  return transaction(db, () => {
-    const delivery = db.prepare(`
-      SELECT company_id AS companyId, recipient
-      FROM mock_delivery_claims WHERE provider_message_id = ? AND state = 'accepted'
-    `).get(providerMessageId);
-    if (!delivery) return { state: "unmatched" };
+  const submit = createMockDeliveryTransport(mock);
+  const delivery = claim(db, account, options);
+  if (delivery.state !== "start") return delivery;
 
-    const event = db.prepare(`
-      INSERT INTO mock_delivery_events (event_id, provider_message_id, type, recorded_at)
-      VALUES (?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING
-    `).run(eventId, providerMessageId, type, now);
-    if (event.changes === 0) return { state: "duplicate" };
-
-    if (type === "hard_bounce" || type === "complaint") {
-      db.prepare(`
-        INSERT INTO recipient_suppressions (company_id, email, created_at)
-        VALUES (?, ?, ?) ON CONFLICT (company_id, email) DO NOTHING
-      `).run(delivery.companyId, delivery.recipient, now);
-    }
-    return { state: "recorded" };
-  });
+  const outcome = await submit(delivery.request);
+  return finish(db, account, delivery, outcome);
 }
