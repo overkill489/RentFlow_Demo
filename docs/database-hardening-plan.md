@@ -32,3 +32,40 @@ Measurements used a disposable indexed file, one warm-up pass per version, then 
 With DELETE journaling, the read snapshot can still delay another writer's exclusive commit. When cancellation is required, recovery can repeat part of the scan and still holds the writer lock for the full cancellation pass. Bounded batches, worker ownership, a common connection policy and measurements on intended deployment storage remain open. The due and draft-queue sweeps also remain open under rank 3.
 
 Backend verification on Node v24.22.3 with `node --test --test-reporter=spec server/jobs/*.test.js server/services/*.test.js` yielded 179 passed, 0 failed, 0 skipped, and 0 cancelled.
+
+## DELETE versus WAL · 2026-11-23
+
+### Connection inventory
+
+The [database module](../server/database/db.js) is the only application connection factory. API routes, auth middleware and startup recovery share one synchronous connection. The due worker, scheduled reconciler and manual recovery CLI each import the same module and open their own connection. Dry-run CLI invocations follow the same configuration path.
+
+| Connection or phase | `journal_mode` | `busy_timeout` | `foreign_keys` | `synchronous` |
+| --- | --- | ---: | --- | --- |
+| API and startup recovery | Inherits file mode, DELETE on a fresh file | 0 ms | ON by Node default, also set in bootstrap and the follow-up router | Runtime default, FULL (2) on the fixture |
+| Due worker, reconciler and manual recovery during import-time bootstrap | Inherits file mode | 0 ms | ON by Node default, also set in bootstrap | Runtime default, FULL (2) on the fixture |
+| Those three CLI entry points after bootstrap | Inherits file mode | 5,000 ms | ON | Runtime default, FULL (2) on the fixture |
+
+Settings were traced in source and verified on disposable connections using Node v24.22.3 and embedded SQLite 3.54.1. The checked-in code sets neither journal mode nor synchronous level. The application database's file mode was not queried. The isolated WAL connections also reported `wal_autocheckpoint=1000` pages, SQLite's default on this build. Existing unit-test connections use in-memory fixtures except the recovery file-backed restart and contention tests. The new journal tests open their own on-disk fixtures.
+
+### Measured writer contention
+
+Two independent Node processes shared each disposable database on the Windows host's local NTFS temporary directory. The reader ran the actual summary-mode recovery against 10,000 healthy pending entries across 100 companies, using the recovery fixture schema and the relevant queue and draft indexes. After the reader established its snapshot, a child began an immediate transaction and inserted one unrelated synthetic suppression. A pre-commit marker coordinated the overlap and a post-commit-attempt marker recorded whether the attempt returned before the reader released its snapshot. Each condition used one warm-up and five measured runs. The snapshots below include synchronization overhead. Commit timing covers the synchronous SQLite call only. Both modes used FULL durability and enabled foreign keys.
+
+| File mode | Writer timeout | Median reader snapshot | Median writer begin | Median commit call (range) | Busy at commit | Successful commits before reader released its snapshot |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| DELETE | 0 ms | 759.43 ms | 0.142 ms | 0.042 ms (0.038–0.052 ms, failed) | 5/5 | 0/5 |
+| WAL | 0 ms | 736.03 ms | 0.019 ms | 2.229 ms (1.951–3.107 ms) | 0/5 | 5/5 |
+| DELETE | 5,000 ms | 667.81 ms | 0.115 ms | 778.074 ms (662.374–788.731 ms) | 0/5 | 0/5 |
+| WAL | 5,000 ms | 737.28 ms | 0.019 ms | 2.899 ms (2.708–3.025 ms) | 0/5 | 5/5 |
+
+Every `BEGIN IMMEDIATE` succeeded. DELETE's contention surfaced at `COMMIT`. At zero timeout the failed transaction was rolled back and the write was absent. All successful writes persisted. The isolated tests also verified that DELETE can retry the same commit after the reader releases its snapshot, WAL keeps the reader's view stable across a writer commit, and a second WAL writer still gets `SQLITE_BUSY` while a first writer owns the lock. These are controlled two-process measurements, with no HTTP traffic, checkpoint load or production volume validation.
+
+### Deployment decision and remaining risks
+
+- **Storage and workers.** The checked-in topology binds Express to loopback and runs both scheduler children with the API's Node executable. That topology is compatible with WAL on one host when all processes share the same local database directory and can access its `-wal` and `-shm` files. The workspace is under OneDrive and the benchmark ran in the local temporary directory. The repository has no production volume or replica configuration, so the actual production mount, synchronization behavior and single-host placement remain unverified. WAL requires same-host shared memory and a suitable local filesystem. [SQLite WAL documentation](https://sqlite.org/wal.html)
+- **Runtime and durability.** The measured SQLite 3.54.1 includes the WAL-reset corruption fix introduced in 3.51.3. Verify the embedded SQLite version of the deployed Node build and any external process that opens the file. The repository currently pins neither. Keep FULL durability in any pilot and measure WAL growth, checkpoint progress and write latency while long snapshots are active. The immediate write sweeps still serialize with other writers. A longer API busy timeout would trade immediate errors for synchronous event-loop stalls. [SQLite WAL documentation](https://sqlite.org/wal.html) · [Node SQLite API](https://nodejs.org/download/release/latest-v24.x/docs/api/sqlite.html)
+- **Backups and migrations.** The isolated online backup restored a write committed while an older WAL snapshot was open, passed integrity and foreign-key checks, and contained the expected row. Production still needs a SQLite-aware backup and restore drill on the target volume. A live main-file copy can omit committed WAL frames. Journal mode persists, so any approved conversion should be a controlled maintenance operation with API, scheduler and manual writers stopped, a verified backup, and mode and integrity checks before restart. Concurrent import-time DDL and backfills still need the single-writer migration strategy in rank 1. [SQLite Online Backup API](https://sqlite.org/backup.html) · [SQLite WAL documentation](https://sqlite.org/wal.html)
+
+WAL materially reduced read/write contention on the fixture. Adoption is deferred until the deployment storage, SQLite versions and backup/migration procedures are verified and a journal-mode change is approved. This investigation made no runtime PRAGMA changes.
+
+On Node v24.22.3, `node --test --test-reporter=spec` from `server/` ran the full backend suite with **182 passed, 0 failed, 0 skipped and 0 cancelled**. A separate run of `server/database/journalContention.test.js` from the repository root had **3 passed, 0 failed, 0 skipped and 0 cancelled**.
