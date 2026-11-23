@@ -1,3 +1,20 @@
+const statementsByDatabase = new WeakMap();
+
+function prepareReadinessQuery(db, sql) {
+  let statements = statementsByDatabase.get(db);
+  if (!statements) {
+    statements = new Map();
+    statementsByDatabase.set(db, statements);
+  }
+
+  let statement = statements.get(sql);
+  if (!statement) {
+    statement = db.prepare(sql);
+    statements.set(sql, statement);
+  }
+  return statement;
+}
+
 export function getDeliveryReadiness(
   db,
   companyId,
@@ -10,44 +27,41 @@ export function getDeliveryReadiness(
     throw new Error("Invalid processing time");
   }
 
-  const quote = db
-    .prepare(
-      `
+  const quote = prepareReadinessQuery(
+    db,
+    `
     SELECT id, customer, equipment, status
     FROM quotes
     WHERE id = ?
       AND company_id = ?
   `,
-    )
-    .get(quoteId, companyId);
+  ).get(quoteId, companyId);
 
   if (!quote) {
     return null;
   }
 
-  const contact = db
-    .prepare(
-      `
+  const contact = prepareReadinessQuery(
+    db,
+    `
     SELECT email, opted_out AS optedOut
     FROM quote_contacts
     WHERE quote_id = ?
   `,
-    )
-    .get(quoteId);
+  ).get(quoteId);
 
-  const followUp = db
-    .prepare(
-      `
+  const followUp = prepareReadinessQuery(
+    db,
+    `
     SELECT scheduled_at AS scheduledAt
     FROM follow_ups
     WHERE quote_id = ?
   `,
-    )
-    .get(quoteId);
+  ).get(quoteId);
 
-  const draft = db
-    .prepare(
-      `
+  const draft = prepareReadinessQuery(
+    db,
+    `
     SELECT
       id,
       recipient_email AS recipientEmail,
@@ -60,23 +74,21 @@ export function getDeliveryReadiness(
     ORDER BY created_at DESC
     LIMIT 1
   `,
-    )
-    .get(quoteId);
+  ).get(quoteId);
 
   const email = contact?.email?.trim().toLowerCase() ?? null;
 
   const suppressed = email
     ? Boolean(
-        db
-          .prepare(
-            `
+        prepareReadinessQuery(
+          db,
+          `
           SELECT 1
           FROM recipient_suppressions
           WHERE company_id = ?
             AND email = ?
         `,
-          )
-          .get(companyId, email),
+        ).get(companyId, email),
       )
     : false;
 

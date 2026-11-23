@@ -253,3 +253,20 @@ test("Readiness checks never modify database data", () => {
     db.close();
   }
 });
+
+test("Repeated readiness checks see current records on the correct connection", (t) => {
+  const first = setup();
+  const second = setup();
+  t.after(() => {
+    first.close();
+    second.close();
+  });
+
+  assert.equal(check(first).status, "needs_review");
+  assert.equal(check(second).status, "needs_review");
+  first.exec("INSERT INTO recipient_suppressions VALUES ('company-a', 'customer@example.test')");
+
+  assert.ok(check(first).reasons.includes("RECIPIENT_OPTED_OUT"));
+  assert.equal(check(second).status, "needs_review");
+  assert.equal(check(first, "company-b"), null);
+});
