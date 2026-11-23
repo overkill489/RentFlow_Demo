@@ -1,6 +1,36 @@
 import { immediateTransaction } from "./immediateTransaction.js";
 
-const VERSION = 1;
+const VERSION = 2;
+
+const ATTEMPTS_V2 = `
+  CREATE TABLE email_delivery_attempts (
+    delivery_id INTEGER NOT NULL REFERENCES email_deliveries(id),
+    number INTEGER NOT NULL CHECK (number > 0),
+    claimed_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT CHECK (outcome IN ('accepted', 'rejected', 'ambiguous')),
+    error_code TEXT,
+    CHECK ((finished_at IS NULL) = (outcome IS NULL)),
+    CHECK (CASE coalesce(outcome, '')
+      WHEN 'rejected' THEN coalesce(error_code, '') IN ('RATE_LIMITED', 'PROVIDER_REJECTED')
+      WHEN 'ambiguous' THEN coalesce(error_code, '') IN ('TIMEOUT', 'UNCONFIRMED_RESPONSE', 'IDEMPOTENCY_CONFLICT')
+      ELSE error_code IS NULL END),
+    PRIMARY KEY (delivery_id, number)
+  ) STRICT;
+`;
+
+function upgradeAttempts(db) {
+  db.exec(`
+    ALTER TABLE email_delivery_attempts RENAME TO email_delivery_attempts_v1;
+    ${ATTEMPTS_V2}
+    INSERT INTO email_delivery_attempts (delivery_id, number, claimed_at, finished_at, outcome, error_code)
+      SELECT delivery_id, number, claimed_at, finished_at, outcome, error_code
+      FROM email_delivery_attempts_v1;
+    DROP TABLE email_delivery_attempts_v1;
+    CREATE UNIQUE INDEX email_delivery_one_open_attempt
+      ON email_delivery_attempts(delivery_id) WHERE finished_at IS NULL;
+  `);
+}
 
 // Explicit installer. Importing this module never opens or changes a database.
 export function migrateEmailDeliveryLedger(db) {
@@ -16,6 +46,11 @@ export function migrateEmailDeliveryLedger(db) {
     `);
     const installed = db.prepare("SELECT MAX(version) AS version FROM email_delivery_schema").get().version;
     if (installed === VERSION) return { version: VERSION, applied: false };
+    if (installed === 1) {
+      upgradeAttempts(db);
+      db.prepare("INSERT INTO email_delivery_schema (version) VALUES (?)").run(VERSION);
+      return { version: VERSION, applied: true };
+    }
     if (installed !== null) throw new Error("Unsupported email delivery schema version");
 
     // Require the existing ownership and suppression schema before creating the ledger.
@@ -60,19 +95,7 @@ export function migrateEmailDeliveryLedger(db) {
         SELECT RAISE(ABORT, 'Email delivery ownership mismatch');
       END;
 
-      CREATE TABLE email_delivery_attempts (
-        delivery_id INTEGER NOT NULL REFERENCES email_deliveries(id),
-        number INTEGER NOT NULL CHECK (number > 0),
-        claimed_at TEXT NOT NULL,
-        finished_at TEXT,
-        outcome TEXT CHECK (outcome IN ('accepted', 'rejected', 'ambiguous')),
-        error_code TEXT CHECK (error_code IN ('RATE_LIMITED', 'TIMEOUT', 'UNCONFIRMED_RESPONSE')),
-        CHECK ((finished_at IS NULL) = (outcome IS NULL)),
-        CHECK ((error_code IS NOT NULL) = (coalesce(outcome, '') IN ('rejected', 'ambiguous'))),
-        CHECK ((coalesce(outcome, '') = 'rejected') = (coalesce(error_code, '') = 'RATE_LIMITED')),
-        PRIMARY KEY (delivery_id, number)
-      ) STRICT;
-
+      ${ATTEMPTS_V2}
       CREATE UNIQUE INDEX email_delivery_one_open_attempt
         ON email_delivery_attempts(delivery_id) WHERE finished_at IS NULL;
 

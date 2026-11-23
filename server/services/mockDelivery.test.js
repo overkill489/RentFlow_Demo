@@ -12,16 +12,8 @@ import { migrateEmailDeliveryLedger } from "../database/emailDeliveryMigration.j
 import { getDeliveryPreflight } from "./deliveryPreflight.js";
 import { attemptDelivery } from "./mockDelivery.js";
 import { createMockDeliveryWebhook } from "./mockDeliveryWebhook.js";
-import { installSenderIdentitySchema, saveSenderIdentity } from "./senderIdentity.js";
-import {
-  installSenderVerificationSchema,
-  prepareSenderDomainVerification,
-} from "./senderVerification.js";
-import { createUnsubscribeToken, installUnsubscribeSchema } from "./unsubscribeService.js";
+import { NOW, RECIPIENT, deliveryOptions, fixture, senderDomain, setup } from "./fixtures/mockDeliveryDatabase.js";
 
-const DUE = "2026-11-23T12:00:00.000Z";
-const NOW = "2026-11-23T12:01:00Z";
-const RECIPIENT = "shared@example.test";
 const SIGNING_KEY = Buffer.alloc(32, 7);
 const SIGNED_AT = Date.parse(NOW);
 const ingest = createMockDeliveryWebhook({ secret: SIGNING_KEY, clock: () => SIGNED_AT });
@@ -33,69 +25,6 @@ function signed(eventId, fields = {}, {
   const signature = createHmac("sha256", SIGNING_KEY)
     .update(`mock-v1.${account}.${timestamp}.${eventId}.`).update(rawBody).digest("hex");
   return { eventId, rawBody, timestamp, signature };
-}
-
-function senderDomain(tenant) {
-  return `sender-${tenant}.rentflow.invalid-domain.com`;
-}
-
-function deliveryOptions(companyId = "a", queueId = `queue-${companyId}`) {
-  return {
-    mode: "mock",
-    companyId,
-    queueId,
-    currentTime: NOW,
-    providerConfig: { provider: "resend", fromEmail: `quotes@${senderDomain(companyId)}` },
-  };
-}
-
-function setup(db, { migrate = true } = {}) {
-  db.exec(`
-    CREATE TABLE companies (id TEXT PRIMARY KEY);
-    CREATE TABLE quotes (id TEXT PRIMARY KEY, company_id TEXT, customer TEXT, equipment TEXT, status TEXT);
-    CREATE TABLE follow_ups (quote_id TEXT PRIMARY KEY, scheduled_at TEXT);
-    CREATE TABLE quote_contacts (quote_id TEXT PRIMARY KEY, email TEXT, opted_out INTEGER);
-    CREATE TABLE outbound_messages (id TEXT PRIMARY KEY, quote_id TEXT, recipient_email TEXT,
-      subject TEXT, body TEXT, status TEXT, created_at TEXT);
-    CREATE TABLE delivery_queue (id TEXT PRIMARY KEY, message_id TEXT UNIQUE, status TEXT);
-    CREATE TABLE delivery_attempts (id TEXT PRIMARY KEY, queue_id TEXT, result TEXT CHECK (result = 'simulated'));
-    CREATE TABLE recipient_suppressions (company_id TEXT REFERENCES companies(id), email TEXT,
-      created_at TEXT, PRIMARY KEY (company_id, email));
-  `);
-  if (migrate) migrateEmailDeliveryLedger(db);
-  installUnsubscribeSchema(db);
-  installSenderIdentitySchema(db);
-  installSenderVerificationSchema(db);
-
-  for (const tenant of ["a", "b"]) {
-    db.prepare("INSERT INTO companies VALUES (?)").run(tenant);
-    assert.equal(saveSenderIdentity(db, tenant, {
-      displayName: 'Equipment, "Rental"', replyToEmail: `office@${senderDomain(tenant)}`,
-    }, DUE).success, true);
-    assert.equal(prepareSenderDomainVerification(db, tenant, DUE).success, true);
-    db.prepare(`
-      UPDATE sender_domain_verifications SET verified_at = ?, last_checked_at = ?,
-        last_check_result = 'TXT_MATCH' WHERE company_id = ?
-    `).run(DUE, DUE, tenant);
-  }
-  for (const [id, tenant] of [["a", "a"], ["b", "b"], ["next", "a"]]) {
-    db.prepare("INSERT INTO quotes VALUES (?, ?, 'Fictional customer', 'Lift', 'Follow-up Scheduled')").run(id, tenant);
-    db.prepare("INSERT INTO follow_ups VALUES (?, ?)").run(id, DUE);
-    db.prepare("INSERT INTO quote_contacts VALUES (?, ?, 0)").run(id, RECIPIENT);
-    const { token } = createUnsubscribeToken(db, {
-      companyId: tenant, quoteId: id, email: RECIPIENT, currentTime: DUE,
-    });
-    db.prepare("INSERT INTO outbound_messages VALUES (?, ?, ?, 'Follow-up', ?, 'draft', ?)")
-      .run(`message-${id}`, id, RECIPIENT, `https://staging.example.test/api/unsubscribe/${token}`, DUE);
-    db.prepare("INSERT INTO delivery_queue VALUES (?, ?, 'approved')").run(`queue-${id}`, `message-${id}`);
-  }
-}
-
-function fixture(t, options) {
-  const db = new DatabaseSync(":memory:");
-  t.after(() => db.close());
-  setup(db, options);
-  return db;
 }
 
 function states(db) {
@@ -323,8 +252,8 @@ test("ledger migration is additive and repeatable on a simulation-era database",
   db.exec("INSERT INTO delivery_attempts VALUES ('original', 'queue-b', 'simulated')");
   const queue = db.prepare("SELECT * FROM delivery_queue ORDER BY id").all();
   const simulations = db.prepare("SELECT * FROM delivery_attempts").all();
-  assert.deepEqual(migrateEmailDeliveryLedger(db), { version: 1, applied: true });
-  assert.deepEqual(migrateEmailDeliveryLedger(db), { version: 1, applied: false });
+  assert.deepEqual(migrateEmailDeliveryLedger(db), { version: 2, applied: true });
+  assert.deepEqual(migrateEmailDeliveryLedger(db), { version: 2, applied: false });
   assert.deepEqual(db.prepare("SELECT * FROM delivery_queue ORDER BY id").all(), queue);
   assert.deepEqual(db.prepare("SELECT * FROM delivery_attempts").all(), simulations);
   assert.deepEqual(states(db), []);
@@ -343,7 +272,7 @@ test("ledger migration rolls back partial DDL and refuses unsupported schema ver
   assert.deepEqual(db.prepare(`
     SELECT name FROM sqlite_schema WHERE name LIKE 'email_deliver%' ORDER BY name
   `).all().map(({ name }) => name), ["email_delivery_events"]);
-  db.exec("CREATE TABLE email_delivery_schema (version INTEGER PRIMARY KEY); INSERT INTO email_delivery_schema VALUES (2)");
+  db.exec("CREATE TABLE email_delivery_schema (version INTEGER PRIMARY KEY); INSERT INTO email_delivery_schema VALUES (3)");
   assert.throws(() => migrateEmailDeliveryLedger(db), /Unsupported email delivery schema version/);
   db.exec("PRAGMA foreign_keys = OFF");
   assert.throws(() => migrateEmailDeliveryLedger(db), /requires foreign keys/);
