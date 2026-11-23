@@ -381,60 +381,51 @@ router.post("/quotes/:id/opt-out", (req, res) => {
 });
 
 router.post("/quotes/:id/draft", (req, res) => {
-  const quote = getOwnedQuote(req, res);
+  const companyId = req.user.companyId;
+  const result = runTransaction(() => {
+    const quote = findQuote.get(req.params.id, companyId);
 
-  if (!quote) return;
+    if (!quote) {
+      return { status: 404, error: "Quote not found" };
+    }
 
-  if (quote.status === "Accepted") {
-    return res.status(409).json({
-      success: false,
-      error: "Accepted quotes cannot receive follow-ups",
-    });
-  }
+    if (quote.status === "Accepted") {
+      return { status: 409, error: "Accepted quotes cannot receive follow-ups" };
+    }
 
-  const contact = findContact.get(quote.id, req.user.companyId);
+    const contact = findContact.get(quote.id, companyId);
 
-  if (!contact) {
-    return res.status(409).json({
-      success: false,
-      error: "Add a customer email before preparing a draft",
-    });
-  }
+    if (!contact) {
+      return { status: 409, error: "Add a customer email before preparing a draft" };
+    }
 
-  if (
-    contact.optedOut ||
-    findSuppression.get(req.user.companyId, contact.email.trim().toLowerCase())
-  ) {
-    return res.status(409).json({
-      success: false,
-      error: "Recipient has opted out of follow-up emails",
-    });
-  }
+    if (
+      contact.optedOut ||
+      findSuppression.get(companyId, contact.email.trim().toLowerCase())
+    ) {
+      return { status: 409, error: "Recipient has opted out of follow-up emails" };
+    }
 
-  const followUp = findScheduledFollowUp.get(quote.id, req.user.companyId);
+    const followUp = findScheduledFollowUp.get(quote.id, companyId);
 
-  if (!followUp) {
-    return res.status(409).json({
-      success: false,
-      error: "Schedule a follow-up before preparing a draft",
-    });
-  }
+    if (!followUp) {
+      return { status: 409, error: "Schedule a follow-up before preparing a draft" };
+    }
 
-  const existing = findActiveDraft.get(quote.id);
+    const existing = findActiveDraft.get(quote.id);
 
-  if (existing) {
-    return res.json({
-      success: true,
-      message: "Existing draft retrieved. No email sent.",
-      data: existing,
-    });
-  }
+    if (existing) {
+      return {
+        status: 200,
+        message: "Existing draft retrieved. No email sent.",
+        data: existing,
+      };
+    }
 
-  const draft = runTransaction(() => {
     const now = new Date().toISOString();
 
     const message = createFollowUpEmailTemplate(db, {
-      companyId: req.user.companyId,
+      companyId,
       quoteId: quote.id,
       customer: quote.customer,
       equipment: quote.equipment,
@@ -456,13 +447,21 @@ router.post("/quotes/:id/draft", (req, res) => {
       "Follow-up email draft prepared with an unsubscribe link. No email was sent.",
     );
 
-    return findActiveDraft.get(quote.id);
+    return {
+      status: 201,
+      message: "Email draft prepared. No email sent.",
+      data: findActiveDraft.get(quote.id),
+    };
   });
 
-  res.status(201).json({
+  if (result.error) {
+    return res.status(result.status).json({ success: false, error: result.error });
+  }
+
+  res.status(result.status).json({
     success: true,
-    message: "Email draft prepared. No email sent.",
-    data: draft,
+    message: result.message,
+    data: result.data,
   });
 });
 
